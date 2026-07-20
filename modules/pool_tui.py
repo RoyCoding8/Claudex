@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from prompt_toolkit import Application
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.styles import Style
+
+from .models import Model
+from .pools import (
+    ModelPool,
+    PoolMember,
+    ensure_default_pools_file,
+    load_pools,
+    save_pools,
+)
+
+# Matches the main model picker aesthetic.
+_STYLE = Style.from_dict(
+    {
+        "": "bg:#111318 #d7dae0",
+        "header": "bg:#181b22",
+        "footer": "bg:#181b22",
+        "title": "bold #8ec7ff",
+        "label": "#aeb6c2",
+        "accent": "bold #8ec7ff",
+        "danger": "bold #ff6b6b",
+        "safe": "bold #7bd88f",
+        "border": "#3a414d",
+        "selected": "bold reverse",
+        "item": "#d7dae0",
+        "muted": "#7f8998",
+        "key": "bold #8ec7ff",
+        "enabled": "#7bd88f",
+        "disabled": "#555a66",
+        "warn": "bold #ffb347",
+    }
+)
+
+
+def _clear() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+# ── Inline prompts ──────────────────────────────────────────────────
+
+
+def _prompt_text(label: str, default: str = "") -> str | None:
+    """Simple line prompt.  Returns *None* when the user leaves it blank
+    and no default is set, or on Ctrl-C / Ctrl-D."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"  {label}{suffix}: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return value or default or None
+
+
+def _prompt_int(
+    label: str,
+    default: int | None = None,
+    *,
+    optional: bool = False,
+) -> int | None:
+    suffix = f" [{default}]" if default is not None else ""
+    opt = " (Enter to skip)" if optional else ""
+    while True:
+        try:
+            raw = input(f"  {label}{opt}{suffix}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return default
+        if not raw:
+            if default is not None:
+                return default
+            if optional:
+                return None
+            continue
+        try:
+            number = int(raw)
+        except ValueError:
+            print("  Enter a whole number.")
+            continue
+        if number <= 0:
+            print("  Must be greater than zero.")
+            continue
+        return number
+
+
+# ── Pool list TUI ───────────────────────────────────────────────────
+
+
+@dataclass
+class _PoolAction:
+    kind: str  # back | add | edit | toggle | delete
+    index: int = -1
+
+
+def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
+    """Full-screen pool list.  Returns the action the user chose."""
+    selected = 0
+    confirming = False
+
+    @Condition
+    def normal() -> bool:
+        return not confirming
+
+    @Condition
+    def deleting() -> bool:
+        return confirming
+
+    # ── content generators ──
+
+    def header_text():
+        return [
+            ("class:title", " Claudex Pool Manager "),
+            ("class:muted", "  load-balanced model routing\n"),
+            ("class:label", " Pools: "),
+            ("class:accent", str(len(pools))),
+            ("class:muted", "   tip: set RPM for smarter rate-aware routing"),
+        ]
+
+    def body_text():
+        if not pools:
+            return [
+                ("class:muted", "\n  No pools configured.\n\n"),
+                ("class:muted", "  Press "),
+                ("class:key", "A"),
+                ("class:muted", " to create your first pool.\n"),
+            ]
+        parts: list[tuple[str, str]] = []
+        for i, pool in enumerate(pools):
+            sel = i == selected
+            prefix = "  › " if sel else "    "
+            style = "class:selected" if sel else "class:item"
+
+            icon = "●" if pool.enabled else "○"
+            icon_style = "class:enabled" if pool.enabled else "class:disabled"
+
+            rpms = [m.rpm for m in pool.members if m.rpm]
+            capacity_str = f"{sum(rpms):,} RPM" if rpms else "auto"
+            info = f"  {len(pool.members)} models · {capacity_str}"
+            state = " enabled" if pool.enabled else " disabled"
+
+            parts.append((icon_style if not sel else style, f"{prefix}{icon} "))
+            parts.append((style, pool.name))
+            parts.append(("class:muted" if not sel else style, info))
+            parts.append((icon_style if not sel else style, state))
+            if i < len(pools) - 1:
+                parts.append(("", "\n"))
+        return parts
+
+    def cursor_pos() -> Point:
+        return Point(0, selected)
+
+    def footer_text():
+        if confirming and pools:
+            name = pools[selected].name
+            return [
+                ("class:danger", f" Delete '{name}'?  "),
+                ("class:key", "Y "),
+                ("class:muted", "confirm  "),
+                ("class:muted", "any other key cancels"),
+            ]
+        return [
+            ("class:key", " ↑↓ "),
+            ("class:muted", "select  "),
+            ("class:key", "A "),
+            ("class:muted", "add  "),
+            ("class:key", "Enter "),
+            ("class:muted", "edit  "),
+            ("class:key", "T "),
+            ("class:muted", "toggle  "),
+            ("class:key", "D "),
+            ("class:muted", "delete  "),
+            ("class:key", "Esc "),
+            ("class:muted", "back"),
+        ]
+
+    # ── layout ──
+
+    header = Window(FormattedTextControl(header_text), height=3, style="class:header")
+    body = Window(
+        FormattedTextControl(body_text, get_cursor_position=cursor_pos, focusable=False),
+        wrap_lines=False,
+        always_hide_cursor=True,
+        right_margins=[],
+    )
+    footer = Window(FormattedTextControl(footer_text), height=1, style="class:footer")
+
+    root = HSplit(
+        [
+            header,
+            Window(height=1, char="─", style="class:border"),
+            body,
+            Window(height=1, char="─", style="class:border"),
+            footer,
+        ]
+    )
+
+    # ── key bindings ──
+
+    kb = KeyBindings()
+
+    @kb.add("up", filter=normal)
+    def _up(event) -> None:
+        nonlocal selected
+        if pools:
+            selected = max(0, selected - 1)
+            event.app.invalidate()
+
+    @kb.add("down", filter=normal)
+    def _down(event) -> None:
+        nonlocal selected
+        if pools:
+            selected = min(len(pools) - 1, selected + 1)
+            event.app.invalidate()
+
+    @kb.add("pageup", filter=normal)
+    def _pgup(event) -> None:
+        nonlocal selected
+        selected = max(0, selected - 10)
+        event.app.invalidate()
+
+    @kb.add("pagedown", filter=normal)
+    def _pgdn(event) -> None:
+        nonlocal selected
+        if pools:
+            selected = min(len(pools) - 1, selected + 10)
+            event.app.invalidate()
+
+    @kb.add("home", filter=normal)
+    def _home(event) -> None:
+        nonlocal selected
+        selected = 0
+        event.app.invalidate()
+
+    @kb.add("end", filter=normal)
+    def _end(event) -> None:
+        nonlocal selected
+        if pools:
+            selected = len(pools) - 1
+            event.app.invalidate()
+
+    @kb.add("a", filter=normal)
+    def _add(event) -> None:
+        event.app.exit(_PoolAction("add"))
+
+    @kb.add("enter", filter=normal)
+    def _edit(event) -> None:
+        if pools:
+            event.app.exit(_PoolAction("edit", selected))
+
+    @kb.add("t", filter=normal)
+    def _toggle(event) -> None:
+        if pools:
+            event.app.exit(_PoolAction("toggle", selected))
+
+    @kb.add("d", filter=normal)
+    def _start_delete(event) -> None:
+        nonlocal confirming
+        if pools:
+            confirming = True
+            event.app.invalidate()
+
+    @kb.add("escape", filter=normal)
+    @kb.add("q", filter=normal)
+    def _back(event) -> None:
+        event.app.exit(_PoolAction("back"))
+
+    # Delete-confirmation mode: only Y confirms, everything else cancels.
+
+    @kb.add("y", filter=deleting)
+    def _confirm_delete(event) -> None:
+        event.app.exit(_PoolAction("delete", selected))
+
+    @kb.add("<any>", filter=deleting)
+    def _cancel_delete(event) -> None:
+        nonlocal confirming
+        confirming = False
+        event.app.invalidate()
+
+    app = Application(
+        layout=Layout(root),
+        key_bindings=kb,
+        style=_STYLE,
+        full_screen=True,
+        mouse_support=False,
+        erase_when_done=True,
+        min_redraw_interval=0.03,
+    )
+    return app.run()
+
+
+# ── Member editor TUI ───────────────────────────────────────────────
+
+
+@dataclass
+class _MemberAction:
+    kind: str  # save | cancel | add | edit
+    index: int = -1
+    members: tuple[PoolMember, ...] = ()
+
+
+def _member_editor_tui(
+    pool_name: str,
+    members: list[PoolMember],
+) -> _MemberAction:
+    """Full-screen member list for a single pool.
+
+    Deletions happen inline (the list is mutated); add/edit exit the TUI
+    so the caller can run model-picker / prompts before re-entering.
+    """
+    selected = 0
+
+    def header_text():
+        rpms = [m.rpm for m in members if m.rpm]
+        mode_str = f"{sum(rpms):,} RPM" if rpms else "auto"
+        return [
+            ("class:title", f" Pool: {pool_name} "),
+            ("class:muted", "  member configuration\n"),
+            ("class:label", " Members: "),
+            ("class:accent", str(len(members))),
+            ("class:label", "   Routing: "),
+            ("class:accent", mode_str),
+        ]
+
+    def body_text():
+        if not members:
+            return [
+                ("class:muted", "\n  No members yet.\n\n"),
+                ("class:muted", "  Press "),
+                ("class:key", "A"),
+                ("class:muted", " to add a model to this pool.\n"),
+            ]
+        parts: list[tuple[str, str]] = []
+        for i, member in enumerate(members):
+            sel = i == selected
+            prefix = "  › " if sel else "    "
+            style = "class:selected" if sel else "class:item"
+
+            rpm_str = f"{member.rpm:,} RPM" if member.rpm else "auto"
+            tpm_str = f"  {member.tpm:,} TPM" if member.tpm else ""
+            pri_str = f"  [Priority: {member.priority}]" if member.priority else ""
+            detail = f"  {rpm_str}{tpm_str}{pri_str}"
+
+            parts.append((style, prefix + member.model))
+            parts.append(("class:muted" if not sel else style, detail))
+            if i < len(members) - 1:
+                parts.append(("", "\n"))
+        return parts
+
+    def cursor_pos() -> Point:
+        return Point(0, selected)
+
+    def footer_text():
+        parts: list[tuple[str, str]] = []
+        if 0 < len(members) < 2:
+            parts.append(("class:warn", " ⚠ Need ≥2 members to save  "))
+        parts.extend(
+            [
+                ("class:key", " ↑↓ "),
+                ("class:muted", "select  "),
+                ("class:key", "A "),
+                ("class:muted", "add  "),
+                ("class:key", "E "),
+                ("class:muted", "edit limits  "),
+                ("class:key", "D "),
+                ("class:muted", "delete  "),
+                ("class:key", "Enter "),
+                ("class:muted", "save  "),
+                ("class:key", "Esc "),
+                ("class:muted", "cancel"),
+            ]
+        )
+        return parts
+
+    header = Window(FormattedTextControl(header_text), height=3, style="class:header")
+    body = Window(
+        FormattedTextControl(body_text, get_cursor_position=cursor_pos, focusable=False),
+        wrap_lines=False,
+        always_hide_cursor=True,
+        right_margins=[],
+    )
+    footer = Window(FormattedTextControl(footer_text), height=1, style="class:footer")
+
+    root = HSplit(
+        [
+            header,
+            Window(height=1, char="─", style="class:border"),
+            body,
+            Window(height=1, char="─", style="class:border"),
+            footer,
+        ]
+    )
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event) -> None:
+        nonlocal selected
+        if members:
+            selected = max(0, selected - 1)
+            event.app.invalidate()
+
+    @kb.add("down")
+    def _down(event) -> None:
+        nonlocal selected
+        if members:
+            selected = min(len(members) - 1, selected + 1)
+            event.app.invalidate()
+
+    @kb.add("pageup")
+    def _pgup(event) -> None:
+        nonlocal selected
+        selected = max(0, selected - 10)
+        event.app.invalidate()
+
+    @kb.add("pagedown")
+    def _pgdn(event) -> None:
+        nonlocal selected
+        if members:
+            selected = min(len(members) - 1, selected + 10)
+            event.app.invalidate()
+
+    @kb.add("a")
+    def _add(event) -> None:
+        event.app.exit(_MemberAction("add"))
+
+    @kb.add("e")
+    def _edit(event) -> None:
+        if members:
+            event.app.exit(_MemberAction("edit", selected))
+
+    @kb.add("d")
+    def _delete(event) -> None:
+        nonlocal selected
+        if members:
+            members.pop(selected)
+            if selected >= len(members) and members:
+                selected = len(members) - 1
+            event.app.invalidate()
+
+    @kb.add("enter")
+    def _save(event) -> None:
+        if len(members) >= 2:
+            event.app.exit(_MemberAction("save", members=tuple(members)))
+        # Otherwise the ⚠ warning is already visible; do nothing.
+
+    @kb.add("escape")
+    def _cancel(event) -> None:
+        event.app.exit(_MemberAction("cancel"))
+
+    app = Application(
+        layout=Layout(root),
+        key_bindings=kb,
+        style=_STYLE,
+        full_screen=True,
+        mouse_support=False,
+        erase_when_done=True,
+        min_redraw_interval=0.03,
+    )
+    return app.run()
+
+
+# ── Composite flows ─────────────────────────────────────────────────
+
+
+def _edit_members_flow(
+    pool_name: str,
+    members: list[PoolMember],
+    upstream_models: list[Model],
+) -> tuple[PoolMember, ...] | None:
+    """Member-editor loop.
+
+    Alternates between the full-screen member TUI and modal prompts
+    (model picker for adds, line prompts for RPM/TPM).  Returns the
+    final member tuple, or *None* if the user cancelled.
+    """
+    while True:
+        result = _member_editor_tui(pool_name, members)
+
+        if result.kind == "cancel":
+            return None
+        if result.kind == "save":
+            return result.members
+
+        if result.kind == "add":
+            # Re-use the main model picker for model selection.
+            from .tui import run_picker
+
+            pick = run_picker(
+                upstream_models,
+                picker_title="[Pool member] Select a model · Esc to cancel",
+                sub_picker=True,
+            )
+            if pick.action == "launch" and pick.model:
+                if any(m.model == pick.model.id for m in members):
+                    _clear()
+                    input("  That model is already in this pool. Press Enter...")
+                    continue
+                _clear()
+                print(f"\n  Adding: {pick.model.id}\n")
+                rpm = _prompt_int("Requests per minute (RPM)", optional=True)
+                tpm = _prompt_int("Tokens per minute (TPM)", optional=True)
+                priority = _prompt_int("Priority / Order (1=highest, blank=auto)", optional=True)
+                members.append(PoolMember(pick.model.id, rpm, tpm, priority))
+            continue
+
+        if result.kind == "edit":
+            current = members[result.index]
+            _clear()
+            print(f"\n  Editing: {current.model}\n")
+            rpm = _prompt_int("Requests per minute (RPM)", current.rpm, optional=True)
+            tpm = _prompt_int("Tokens per minute (TPM)", current.tpm, optional=True)
+            priority = _prompt_int("Priority / Order (1=highest, blank=auto)", getattr(current, "priority", None), optional=True)
+            members[result.index] = PoolMember(current.model, rpm, tpm, priority)
+            continue
+
+
+# ── Public entry point ──────────────────────────────────────────────
+
+
+def run_pool_manager(upstream_models: list[Model]) -> bool:
+    """Interactive pool manager.  Returns *True* when data changed."""
+    ensure_default_pools_file()
+    changed = False
+
+    while True:
+        pools = load_pools(upstream_models=upstream_models)
+        result = _pool_list_tui(pools)
+
+        if result.kind == "back":
+            return changed
+
+        if result.kind == "add":
+            _clear()
+            print("\n  Create a new pool\n")
+            name = _prompt_text("Pool name (used as model ID)")
+            if not name:
+                continue
+            if any(p.name == name for p in pools) or any(
+                m.id == name for m in upstream_models
+            ):
+                _clear()
+                input("  That name already exists. Press Enter...")
+                continue
+            members = _edit_members_flow(name, [], upstream_models)
+            if members is None:
+                continue
+            pools.append(ModelPool(name=name, members=members))
+            save_pools(pools)
+            changed = True
+
+        elif result.kind == "edit" and pools:
+            pool = pools[result.index]
+            _clear()
+            print(f"\n  Editing pool: {pool.name}\n")
+            new_name = _prompt_text("Pool name", pool.name)
+            if not new_name:
+                continue
+            if new_name != pool.name and (
+                any(p.name == new_name for p in pools)
+                or any(m.id == new_name for m in upstream_models)
+            ):
+                _clear()
+                input("  That name already exists. Press Enter...")
+                continue
+            members = _edit_members_flow(
+                new_name, list(pool.members), upstream_models
+            )
+            if members is None:
+                continue
+            pools[result.index] = ModelPool(
+                name=new_name, members=members, enabled=pool.enabled
+            )
+            save_pools(pools)
+            changed = True
+
+        elif result.kind == "toggle" and pools:
+            pool = pools[result.index]
+            pools[result.index] = ModelPool(
+                name=pool.name,
+                members=pool.members,
+                enabled=not pool.enabled,
+            )
+            save_pools(pools)
+            changed = True
+
+        elif result.kind == "delete" and pools:
+            pools.pop(result.index)
+            save_pools(pools)
+            changed = True

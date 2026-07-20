@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+
+# Local secrets / configuration. .env.example is a tracked template; the real
+# .env is local-only and may hold local API keys and machine-specific paths.
+.env
+.env.*
+!.env.example
+
+# Local configuration and runtime state. Tracked *.example.json files are safe templates.
+data/pools.json
+data/settings.json
+data/*.broken_*.json
+data/*.log
+data/*.pid
+data/*.err
+data/*.tmp
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local backup files
+*.bak
+*.bak-*
