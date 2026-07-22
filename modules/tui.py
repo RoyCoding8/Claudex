@@ -25,25 +25,30 @@ class PickerResult:
     gpt_medium_model: str | None = None
     gpt_subagent_model: str | None = None
 
+
+def _exit_once(event, result: PickerResult) -> None:
+    """Ignore a queued key event after Prompt Toolkit has accepted a result."""
+    if not event.app.is_done:
+        event.app.exit(result)
+
+
+def _model_settings_for(model_id: str) -> dict:
+    settings = _load_settings()
+    model_settings = settings.get("model_settings", {})
+    if not isinstance(model_settings, dict):
+        return {}
+    model = model_settings.get(model_id, {})
+    return model if isinstance(model, dict) else {}
+
+
 def get_model_autocompact(model_id: str) -> bool | None:
-    settings = _load_settings()
-    return settings.get('model_settings', {}).get(model_id, {}).get('auto_compact')
+    value = _model_settings_for(model_id).get("auto_compact")
+    return value if isinstance(value, bool) else None
 
-def get_model_context(
-    model_id: str,
-) -> int | None:
-    settings = _load_settings()
 
-    model_settings = settings.get(
-        "model_settings",
-        {},
-    )
-
-    model = model_settings.get(
-        model_id,
-        {},
-    )
-    return model.get("context_tokens")
+def get_model_context(model_id: str) -> int | None:
+    value = _model_settings_for(model_id).get("context_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 def _load_settings() -> dict:
     if not SETTINGS_FILE.exists() and SETTINGS_EXAMPLE_FILE.is_file():
@@ -71,6 +76,83 @@ def _save_settings(data: dict) -> None:
     temporary = SETTINGS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SETTINGS_FILE)
+
+
+def _prompt_context_tokens(current: int | None) -> int | None:
+    current_text = str(current) if current is not None else "default"
+    while True:
+        raw = input(f"Context size in tokens [{current_text}]: ").strip().lower()
+        if not raw:
+            return current
+        if raw in {"clear", "default"}:
+            return None
+        try:
+            value = int(raw.replace("_", "").replace(",", ""))
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        print("Enter a positive integer, or 'clear' to use Claude Code's default.")
+
+
+def _prompt_auto_compact(current: bool | None) -> bool | None:
+    current_text = {True: "on", False: "off", None: "default"}[current]
+    while True:
+        raw = input(f"Auto-compact: on/off/default [{current_text}]: ").strip().lower()
+        if not raw:
+            return current
+        if raw in {"on", "yes", "y", "true", "1"}:
+            return True
+        if raw in {"off", "no", "n", "false", "0"}:
+            return False
+        if raw in {"clear", "default"}:
+            return None
+        print("Enter 'on', 'off', or 'default'.")
+
+
+def configure_model_parameters(model_id: str) -> None:
+    """Edit the selected model's supported settings without touching other keys."""
+    settings = _load_settings()
+    all_models = settings.get("model_settings")
+    if not isinstance(all_models, dict):
+        all_models = {}
+        settings["model_settings"] = all_models
+
+    existing = all_models.get(model_id)
+    model = dict(existing) if isinstance(existing, dict) else {}
+    current_context = model.get("context_tokens")
+    if (
+        not isinstance(current_context, int)
+        or isinstance(current_context, bool)
+        or current_context <= 0
+    ):
+        current_context = None
+    current_auto_compact = model.get("auto_compact")
+    if not isinstance(current_auto_compact, bool):
+        current_auto_compact = None
+
+    print(f"Model parameters\n\n  {model_id}\n")
+    print("Press Enter to keep a value; type 'clear' to restore its default.\n")
+    context_tokens = _prompt_context_tokens(current_context)
+    auto_compact = _prompt_auto_compact(current_auto_compact)
+
+    if context_tokens is None:
+        model.pop("context_tokens", None)
+    else:
+        model["context_tokens"] = context_tokens
+    if auto_compact is None:
+        model.pop("auto_compact", None)
+    else:
+        model["auto_compact"] = auto_compact
+
+    if model:
+        all_models[model_id] = model
+    else:
+        all_models.pop(model_id, None)
+    _save_settings(settings)
+    print("\nSaved to data/settings.json.")
+    input("Press Enter to return to Claudex...")
+
 
 def set_extra_model(key: str, value: str | None) -> None:
     settings = _load_settings()
@@ -270,14 +352,14 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
                 ("class:muted", "CLIProxy UI  "),
                 ("class:key", "F9 "),
                 ("class:muted", "gateway  "),
+                ("class:key", "F10 "),
+                ("class:muted", "model params  "),
                 ("class:key", "Del "),
                 ("class:muted", "clear  "),
                 ("class:key", "Ctrl+S "),
                 ("class:muted", "permissions  "),
                 ("class:key", "Esc "),
-                ("class:muted", "clear  "),
-                ("class:key", "Ctrl+Q "),
-                ("class:muted", "exit"),
+                ("class:muted", "clear/exit"),
             ]
         ),
         height=1,
@@ -365,47 +447,56 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
     @bindings.add("c-r")
     def _refresh(event) -> None:
         persist(selected_model())
-        event.app.exit(PickerResult("refresh", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, PickerResult("refresh", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("f6")
     def _config(event) -> None:
         if sub_picker:
             return
         persist(selected_model())
-        event.app.exit(PickerResult("configure", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, PickerResult("configure", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("f7")
     def _pools(event) -> None:
         if sub_picker:
             return
         persist(selected_model())
-        event.app.exit(PickerResult("pools", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, PickerResult("pools", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("f8")
     def _management(event) -> None:
         if sub_picker:
             return
         persist(selected_model())
-        event.app.exit(PickerResult("management", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, PickerResult("management", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("f9")
     def _gateway(event) -> None:
         if sub_picker:
             return
         persist(selected_model())
-        event.app.exit(PickerResult("gateway", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, PickerResult("gateway", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+
+    @bindings.add("f10")
+    def _model_parameters(event) -> None:
+        if sub_picker:
+            return
+        model = selected_model()
+        if model is not None:
+            persist(model)
+            _exit_once(event, PickerResult("model_parameters", model, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("delete")
     def _clear_selection(event) -> None:
         if sub_picker:
-            event.app.exit(PickerResult("clear", None, skip_permissions, None, None, None, None, None))
+            _exit_once(event, PickerResult("clear", None, skip_permissions, None, None, None, None, None))
 
     @bindings.add("enter")
     def _launch(event) -> None:
         model = selected_model()
         if model:
             persist(model)
-            event.app.exit(PickerResult("launch", model, skip_permissions, get_model_context(model.id), get_model_autocompact(model.id), gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+            _exit_once(event, PickerResult("launch", model, skip_permissions, get_model_context(model.id), get_model_autocompact(model.id), gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     @bindings.add("escape")
     def _escape(event) -> None:
@@ -414,13 +505,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         else:
             persist(selected_model())
             action = "cancel" if sub_picker else "exit"
-            event.app.exit(PickerResult(action, None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
-
-    @bindings.add("c-q")
-    def _quit(event) -> None:
-        persist(selected_model())
-        action = "quit" if sub_picker else "exit"
-        event.app.exit(PickerResult(action, None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+            _exit_once(event, PickerResult(action, None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
 
     style = Style.from_dict(
         {

@@ -69,22 +69,7 @@ _COOLDOWN_ON_NETERR = ROUTER_COOLDOWN_NETWORK
 _COOLDOWN_ON_AUTH = ROUTER_COOLDOWN_AUTH
 _ERROR_PEEK_BYTES = 16 * 1024
 
-# HTTP status codes worth retrying (transient upstream failures).
-_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _AUTH_STATUS = frozenset({401, 403})
-_PROVIDER_FAILURE_TERMS = (
-    "api key",
-    "apikey",
-    "authentication",
-    "authenticate",
-    "authorization",
-    "unauthorized",
-    "forbidden",
-    "credential",
-    "rate limit",
-    "too many requests",
-    "quota",
-)
 
 # Hop-by-hop headers we must not forward as-is (RFC 7230 §6.1).
 _HOP_BY_HOP = frozenset(
@@ -699,83 +684,29 @@ def _peek_body_chunk(upstream: _UpstreamResponse) -> bytes:
     return chunk
 
 
-def _read_error_body(
-    upstream: _UpstreamResponse,
-    max_bytes: int = _ERROR_PEEK_BYTES,
-) -> tuple[bytes, Iterable[bytes]]:
-    """Read a bounded prefix while preserving it for non-retryable forwarding."""
-    chunks: list[bytes] = []
-    remaining = max_bytes
-    iterator = iter(upstream.body_iter)
-    try:
-        while remaining > 0:
-            chunk = next(iterator)
-            chunks.append(chunk)
-            remaining -= len(chunk)
-    except StopIteration:
-        pass
-    data = b"".join(chunks)
-    return data[:max_bytes], chain(chunks, iterator)
-
-
-def _error_text(data: bytes) -> str:
-    text = data.decode("utf-8", errors="replace")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-    values: list[str] = []
-
-    def collect(value: Any) -> None:
-        if isinstance(value, str):
-            values.append(value)
-        elif isinstance(value, dict):
-            for nested in value.values():
-                collect(nested)
-        elif isinstance(value, list):
-            for nested in value:
-                collect(nested)
-
-    collect(payload)
-    return " ".join(values) or text
-
-
 def _classify_retry(upstream: _UpstreamResponse) -> tuple[str, float] | None:
+    """Classify a pooled-member response using protocol signals, not body text."""
     status = upstream.status
-    if status == 200 and _is_event_stream(upstream.headers):
-        data = _peek_body_chunk(upstream)
-        normalized = " ".join(data.decode("utf-8", errors="replace").lower().split())
-        if _looks_like_stream_error(normalized):
-            category = "rate_limit" if any(
-                term in normalized for term in ("rate limit", "too many requests", "quota")
-            ) else "auth"
-            delay = _COOLDOWN_ON_429_DEFAULT if category == "rate_limit" else _COOLDOWN_ON_AUTH
-            return category, delay
+
+    if 200 <= status < 300:
+        if _is_event_stream(upstream.headers):
+            data = _peek_body_chunk(upstream)
+            normalized = " ".join(data.decode("utf-8", errors="replace").lower().split())
+            if _looks_like_stream_error(normalized):
+                return "stream_error", _COOLDOWN_ON_5XX
+        return None
+
+    _drain_error_body(upstream)
     if status == 429:
-        _drain_error_body(upstream)
         return (
             "rate_limit",
             _retry_after_seconds(upstream.headers, _COOLDOWN_ON_429_DEFAULT),
         )
-    if status in _RETRYABLE_STATUS:
-        _drain_error_body(upstream)
-        return "upstream", _COOLDOWN_ON_5XX
     if status in _AUTH_STATUS:
-        _drain_error_body(upstream)
         return "auth", _COOLDOWN_ON_AUTH
-    if status != 400:
-        return None
-
-    data, body_iter = _read_error_body(upstream)
-    upstream.body_iter = body_iter
-    normalized = " ".join(_error_text(data).lower().split())
-    if any(term in normalized for term in _PROVIDER_FAILURE_TERMS):
-        category = "rate_limit" if any(
-            term in normalized for term in ("rate limit", "too many requests", "quota")
-        ) else "auth"
-        delay = _COOLDOWN_ON_429_DEFAULT if category == "rate_limit" else _COOLDOWN_ON_AUTH
-        return category, delay
-    return None
+    if 400 <= status < 500:
+        return "rejected", _COOLDOWN_ON_5XX
+    return "upstream", _COOLDOWN_ON_5XX
 
 
 def _is_event_stream(headers: list[tuple[str, str]]) -> bool:
@@ -786,8 +717,11 @@ def _is_event_stream(headers: list[tuple[str, str]]) -> bool:
 
 
 def _looks_like_stream_error(text: str) -> bool:
-    has_error_event = "event: error" in text or '"type":"error"' in text or '"type": "error"' in text
-    return has_error_event and any(term in text for term in _PROVIDER_FAILURE_TERMS)
+    return (
+        "event: error" in text
+        or '"type":"error"' in text
+        or '"type": "error"' in text
+    )
 
 
 def _drain_error_body(upstream: _UpstreamResponse, max_bytes: int = 400) -> None:

@@ -13,8 +13,9 @@ Claude Code → cx router :4000 → CLIProxyAPI :8317 → providers
   routing, retries, and cooldowns. It speaks Claude Code's Anthropic `/v1/messages` protocol and
   passes everything else through unchanged.
 
-The router is a single-file, stdlib-only Python service (~740 lines, one runtime dependency:
-`prompt-toolkit` for the TUI). It boots in ~250ms and requires no build step.
+The router is a single-file, stdlib-only Python service (~740 lines). The launcher adds two small
+runtime dependencies: `prompt-toolkit` for the TUI and `python-dotenv` for optional `.env` loading.
+It boots in ~250ms and requires no build step.
 
 ## Quick start
 
@@ -26,8 +27,8 @@ project's launcher, or point Claudex at their locations with `CX_CLIPROXY_EXE` a
 cx.bat
 ```
 
-The first run uses [`uv`](https://github.com/astral-sh/uv) to install `prompt-toolkit` into a local
-`.venv/`. Subsequent runs are instant. `cx.bat`:
+The first run uses [`uv`](https://github.com/astral-sh/uv) to install `prompt-toolkit` and
+`python-dotenv` into a local `.venv/`. Subsequent runs are instant. `cx.bat`:
 
 1. Starts CLIProxyAPI if it isn't already running.
 2. Starts the cx router if it isn't already running.
@@ -56,15 +57,28 @@ via `mtime`, so edits take effect without restarting anything.
 Selecting a pool in the picker tells Claude Code to send its `model` field as the pool name (e.g.
 `Opus-level`). The router rewrites that name to a real backend model per request.
 
+## Model parameters
+
+Highlight a model or pool and press **F10** to edit its per-model launch settings:
+
+- **Context size** writes `context_tokens` under that model in `data/settings.json` and sets
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` when launched. Commas and underscores are accepted.
+- **Auto-compact** can be `on`, `off`, or `default`. `off` disables compacting; `on` uses 85% of
+  the configured context size as the auto-compact window; `default` removes the override.
+
+Press Enter to keep the current value or type `clear` to restore its default. The editor preserves
+other models and unknown per-model keys. In the picker, **Esc** clears a non-empty search first and
+exits (or cancels a sub-picker) when the search is already empty.
+
 ## Router semantics
 
 - **Selection**. Strict priority tiers: the router only considers members at the lowest priority
   number available. Within a tier, it picks weighted-random by `rpm`. A member missing `priority`
   falls to the *default* tier (`0`); missing `rpm` defaults to `1`.
-- **Retry**. On a member-scoped failure — `401`/`403`, API-key/auth/rate-limit-shaped `400` or
-  first SSE error event, `429` (with `Retry-After` honored), any `5xx`, or a network error — the
-  router marks that real backend model as cooling-down and tries the next member once. The budget is
-  `min(pool_size, 8)` attempts.
+- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response,
+  network error, or first SSE `error` event cools that backend and tries the next member. `401`/`403`
+  use the authentication cooldown; `429` honors `Retry-After`; other `4xx`, `5xx`, and unexpected
+  statuses use the upstream-failure cooldown. The budget is `min(pool_size, 8)` attempts.
 - **Cooldown**. `429` cools by `Retry-After` if provided else 60s; `5xx` cools 30s; a network
   error cools 10s; provider authentication failures cool 300s. Cooldown is keyed by the real
   backend model, so if the same backend appears in multiple pools its cooldown is shared.
@@ -72,8 +86,9 @@ Selecting a pool in the picker tells Claude Code to send its `model` field as th
   any bytes have been forwarded to the client, retries are not attempted (they can't be, safely).
 - **Passthrough**. If the incoming `model` field is not one of your enabled pool names, the
   request is forwarded unchanged. Pooled `count_tokens` requests use the same failover policy.
-- **Errors**. Ordinary request-validation `4xx` responses are forwarded verbatim. If every pool
-  member fails, the router returns a sanitized `503` summary without upstream bodies or keys.
+- **Errors**. Non-pooled requests preserve upstream responses unchanged. For a pool, every member
+  rejection is retried within the bounded attempt budget; if all members fail, the router returns a
+  sanitized `503` summary without upstream bodies or keys.
 
 ## Endpoints
 
@@ -136,7 +151,8 @@ data/
   router.log                # router runtime log (ignored)
   router.pid                # router pid (ignored)
 tests/
-  test_router.py            # pool pick + body/header rewrite + parse
+  test_router.py            # pool selection, forwarding, failover, streaming
+  test_tui.py               # picker exit safety + model parameter editing
   test_pools.py             # pools.json schema + validation
   test_models.py            # /v1/models fetch + dedup
   test_launcher.py          # Claude Code env setup

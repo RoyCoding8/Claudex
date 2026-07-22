@@ -90,6 +90,12 @@ def main() -> int:
                     print("\n  Router will start automatically on next refresh.")
                     input("  Press Enter to return...")
                 continue
+            if result.action == "model_parameters" and result.model:
+                from modules.tui import configure_model_parameters
+
+                clear_console()
+                configure_model_parameters(result.model.id)
+                continue
             if result.action == "configure":
                 from modules.tui import set_extra_model
 
@@ -98,8 +104,6 @@ def main() -> int:
                     picker_title="[Fast/Haiku] Select model or pool · Del clear · Esc cancel",
                     sub_picker=True,
                 )
-                if fast_res.action == "quit":
-                    return 0
                 if fast_res.action == "cancel":
                     continue
                 if fast_res.action == "launch" and fast_res.model:
@@ -112,8 +116,6 @@ def main() -> int:
                     picker_title="[Medium/Sonnet] Select model or pool · Del clear · Esc cancel",
                     sub_picker=True,
                 )
-                if med_res.action == "quit":
-                    return 0
                 if med_res.action == "cancel":
                     continue
                 if med_res.action == "launch" and med_res.model:
@@ -126,8 +128,6 @@ def main() -> int:
                     picker_title="[Subagent] Select model or pool · Del clear · Esc cancel",
                     sub_picker=True,
                 )
-                if sub_res.action == "quit":
-                    return 0
                 if sub_res.action == "cancel":
                     continue
                 if sub_res.action == "launch" and sub_res.model:

@@ -125,8 +125,12 @@ def _running_router(
     upstream_thread.join(timeout=2)
 
 
-def _post(router: _RouterServer, path: str = "/v1/messages") -> tuple[int, bytes]:
-    body = json.dumps({"model": "test-pool", "messages": []}).encode("utf-8")
+def _post(
+    router: _RouterServer,
+    path: str = "/v1/messages",
+    model: str = "test-pool",
+) -> tuple[int, bytes]:
+    body = json.dumps({"model": model, "messages": []}).encode("utf-8")
     connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=3)
     connection.request(
         "POST",
@@ -279,20 +283,50 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": True})
         self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
 
-    def test_stream_error_event_tries_next_member_before_forwarding(self) -> None:
-        with _running_router(
+    def test_malformed_provider_json_in_bad_request_tries_next_member(self) -> None:
+        malformed_responses = (
+            b'{"error":{"message":"NVIDIA NIM returned malformed JSON in tool call"}}',
+            b'{"error":{"message":"Failed to parse assistant response"}}',
             (
-                200,
-                {"Content-Type": "text/event-stream"},
-                b'event: error\ndata: {"type":"error","error":{"message":"API Key error"}}\n\n',
+                b'{"error":{"message":"Failed to deserialize the JSON body into the target '
+                b'type: data did not match any variant of untagged enum '
+                b'ChatCompletionRequestToolMessageContent at line 1 column 1234711"}}'
             ),
-            (200, {}, b'{"ok":true}'),
-        ) as router:
-            status, body = _post(router)
+        )
+        for error_body in malformed_responses:
+            with self.subTest(error_body=error_body):
+                with _running_router(
+                    (400, {}, error_body),
+                    (200, {}, b'{"ok":true}'),
+                ) as router:
+                    status, body = _post(router)
 
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"ok": True})
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"ok": True})
+                self.assertEqual(
+                    _UpstreamHandler.models,
+                    ["provider/first", "provider/second"],
+                )
+
+    def test_stream_error_event_tries_next_member_before_forwarding(self) -> None:
+        stream_errors = (
+            b'event: error\ndata: {"type":"error","error":{"message":"API Key error"}}\n\n',
+            b'event: error\ndata: {"type":"error","error":{"message":"unknown provider failure"}}\n\n',
+        )
+        for stream_error in stream_errors:
+            with self.subTest(stream_error=stream_error):
+                with _running_router(
+                    (200, {"Content-Type": "text/event-stream"}, stream_error),
+                    (200, {}, b'{"ok":true}'),
+                ) as router:
+                    status, body = _post(router)
+
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"ok": True})
+                self.assertEqual(
+                    _UpstreamHandler.models,
+                    ["provider/first", "provider/second"],
+                )
 
     def test_server_error_tries_next_member(self) -> None:
         with _running_router(
@@ -378,15 +412,30 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertNotIn(first_secret, body.decode())
         self.assertNotIn(second_secret, body.decode())
 
-    def test_validation_error_is_forwarded_without_retry(self) -> None:
-        with _running_router(
-            (400, {}, b'{"error":{"message":"invalid request schema"}}'),
-        ) as router:
-            status, body = _post(router)
+    def test_any_member_4xx_tries_next_member_without_inspecting_text(self) -> None:
+        for status_code in (400, 404, 422):
+            with self.subTest(status=status_code):
+                with _running_router(
+                    (status_code, {}, b'{"error":{"message":"arbitrary rejection"}}'),
+                    (200, {}, b'{"ok":true}'),
+                ) as router:
+                    status, body = _post(router)
+
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"ok": True})
+                self.assertEqual(
+                    _UpstreamHandler.models,
+                    ["provider/first", "provider/second"],
+                )
+
+    def test_non_pool_400_is_forwarded_unchanged(self) -> None:
+        error_body = b'{"error":{"message":"direct model rejected request"}}'
+        with _running_router((400, {}, error_body)) as router:
+            status, body = _post(router, model="provider/direct")
 
         self.assertEqual(status, 400)
-        self.assertEqual(json.loads(body)["error"]["message"], "invalid request schema")
-        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+        self.assertEqual(body, error_body)
+        self.assertEqual(_UpstreamHandler.models, ["provider/direct"])
 
 
 if __name__ == "__main__":
