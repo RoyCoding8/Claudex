@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from prompt_toolkit import Application
 from prompt_toolkit.data_structures import Point
@@ -66,6 +66,7 @@ def _prompt_int(
     default: int | None = None,
     *,
     optional: bool = False,
+    minimum: int = 1,
 ) -> int | None:
     suffix = f" [{default}]" if default is not None else ""
     opt = " (Enter to skip)" if optional else ""
@@ -85,8 +86,8 @@ def _prompt_int(
         except ValueError:
             print("  Enter a whole number.")
             continue
-        if number <= 0:
-            print("  Must be greater than zero.")
+        if number < minimum:
+            print(f"  Must be at least {minimum}.")
             continue
         return number
 
@@ -507,7 +508,9 @@ def _edit_members_flow(
                 print(f"\n  Adding: {pick.model.id}\n")
                 rpm = _prompt_int("Requests per minute (RPM)", optional=True)
                 tpm = _prompt_int("Tokens per minute (TPM)", optional=True)
-                priority = _prompt_int("Priority / Order (1=highest, blank=auto)", optional=True)
+                priority = _prompt_int(
+                    "Priority / Order (0=highest, blank=auto)", optional=True, minimum=0
+                )
                 members.append(PoolMember(pick.model.id, rpm, tpm, priority))
             continue
 
@@ -517,8 +520,13 @@ def _edit_members_flow(
             print(f"\n  Editing: {current.model}\n")
             rpm = _prompt_int("Requests per minute (RPM)", current.rpm, optional=True)
             tpm = _prompt_int("Tokens per minute (TPM)", current.tpm, optional=True)
-            priority = _prompt_int("Priority / Order (1=highest, blank=auto)", getattr(current, "priority", None), optional=True)
-            members[result.index] = PoolMember(current.model, rpm, tpm, priority)
+            priority = _prompt_int(
+                "Priority / Order (0=highest, blank=auto)", current.priority,
+                optional=True, minimum=0,
+            )
+            # Keep all unsupported-by-this-screen fields. Reconstructing this
+            # dataclass positionally used to erase an existing limit/cooldown.
+            members[result.index] = replace(current, rpm=rpm, tpm=tpm, priority=priority)
             continue
 
 

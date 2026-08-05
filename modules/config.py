@@ -2,22 +2,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-SETTINGS_EXAMPLE_FILE = DATA_DIR / "settings.example.json"
-POOLS_FILE = DATA_DIR / "pools.json"
-POOLS_EXAMPLE_FILE = DATA_DIR / "pools.example.json"
+SETTINGS_FILE, SETTINGS_EXAMPLE_FILE = DATA_DIR / "settings.json", DATA_DIR / "settings.example.json"
+POOLS_FILE, POOLS_EXAMPLE_FILE = DATA_DIR / "pools.json", DATA_DIR / "pools.example.json"
 ENV_FILE = ROOT / ".env"
-
-# Load .env before any env var below is read. ``override=False`` means a value
-# already present in the real environment wins over the file, so explicit
-# shell/launcher exports still take precedence. This runs at import time in
-# both the launcher (cx.py) and the router subprocess (``python -m
-# modules.router``), which both import this module first.
 if ENV_FILE.is_file():
     load_dotenv(ENV_FILE, override=False)
 
@@ -28,36 +19,24 @@ def _env_path(name: str, default: Path) -> Path:
 
 
 def _env(name: str, *aliases: str, default: str) -> str:
-    """Return the first non-empty env var among ``(name, *aliases)``, else ``default``.
-
-    The primary name (``name``) always wins if set. Aliases exist to
-    keep legacy CX_LITELLM_* env overrides working after the router
-    replaced LiteLLM.
-    """
     for candidate in (name, *aliases):
-        value = os.environ.get(candidate, "").strip()
-        if value:
+        if value := os.environ.get(candidate, "").strip():
             return value
     return default
 
 
 def _env_int(name: str, *aliases: str, default: int) -> int:
-    raw = _env(name, *aliases, default="")
-    if not raw:
+    value = _env(name, *aliases, default="")
+    if not value:
         return default
     try:
-        return int(raw)
+        return int(value)
     except ValueError as error:
-        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from error
+        raise RuntimeError(f"{name} must be an integer, got {value!r}.") from error
 
 
-def _env_float(
-    name: str,
-    *aliases: str,
-    default: float,
-    minimum: float = 0.0,
-    maximum: float | None = None,
-) -> float:
+def _env_float(name: str, *aliases: str, default: float, minimum: float = 0.0,
+               maximum: float | None = None) -> float:
     raw = _env(name, *aliases, default="")
     if not raw:
         return default
@@ -66,49 +45,29 @@ def _env_float(
     except ValueError as error:
         raise RuntimeError(f"{name} must be a number, got {raw!r}.") from error
     if value < minimum or (maximum is not None and value > maximum):
-        maximum_text = f" and at most {maximum:g}" if maximum is not None else ""
-        raise RuntimeError(
-            f"{name} must be at least {minimum:g}{maximum_text}, got {raw!r}."
-        )
+        max_text = f" and at most {maximum:g}" if maximum is not None else ""
+        raise RuntimeError(f"{name} must be at least {minimum:g}{max_text}, got {raw!r}.")
     return value
 
 
-# ---------------------------------------------------------------- CLIProxyAPI
-
 PROXY_EXE = _env_path("CX_CLIPROXY_EXE", Path("cli-proxy-api.exe"))
 PROXY_CONFIG = _env_path("CX_CLIPROXY_CONFIG", Path("config.yaml"))
-PROXY_LOG = DATA_DIR / "cli-proxy-api.log"
-PROXY_HOST = _env("CX_CLIPROXY_HOST", default="127.0.0.1")
-PROXY_PORT = _env_int("CX_CLIPROXY_PORT", default=8317)
+PROXY_LOG, PROXY_PID = DATA_DIR / "cli-proxy-api.log", DATA_DIR / "cli-proxy-api.pid"
+PROXY_HOST, PROXY_PORT = _env("CX_CLIPROXY_HOST", default="127.0.0.1"), _env_int("CX_CLIPROXY_PORT", default=8317)
 PROXY_API_KEY = _env("CX_CLIPROXY_API_KEY", default="sk-dummy")
 PROXY_START_TIMEOUT = _env_float("CX_CLIPROXY_START_TIMEOUT", default=15.0, minimum=0.1)
 
-# ------------------------------------------------------------------ cx-router
-
-# The router is the client-facing endpoint that speaks Anthropic /v1/messages
-# and routes pool requests across CLIProxyAPI providers. It replaces LiteLLM,
-# but keeps the legacy CX_LITELLM_* env overrides working so shells and
-# launchers configured before the migration continue to run unchanged.
 ROUTER_HOST = _env("CX_ROUTER_HOST", "CX_LITELLM_HOST", default="127.0.0.1")
 ROUTER_PORT = _env_int("CX_ROUTER_PORT", "CX_LITELLM_PORT", default=4000)
 ROUTER_API_KEY = _env("CX_ROUTER_API_KEY", "CX_LITELLM_API_KEY", default="sk-cx-local")
-ROUTER_LOG = DATA_DIR / "router.log"
-ROUTER_PID = DATA_DIR / "router.pid"
-ROUTER_START_TIMEOUT = _env_float("CX_ROUTER_START_TIMEOUT", default=10.0, minimum=0.1)
-ROUTER_COOLDOWN_429 = _env_float(
-    "CX_ROUTER_COOLDOWN_429", default=60.0, minimum=1.0, maximum=1800.0
-)
-ROUTER_COOLDOWN_5XX = _env_float(
-    "CX_ROUTER_COOLDOWN_5XX", default=30.0, minimum=1.0, maximum=1800.0
-)
-ROUTER_COOLDOWN_NETWORK = _env_float(
-    "CX_ROUTER_COOLDOWN_NETWORK", default=10.0, minimum=1.0, maximum=1800.0
-)
-ROUTER_COOLDOWN_AUTH = _env_float(
-    "CX_ROUTER_COOLDOWN_AUTH", default=300.0, minimum=1.0, maximum=1800.0
-)
-
-# --------------------------------------------------------------- model defaults
+ROUTER_LOG, ROUTER_PID = DATA_DIR / "router.log", DATA_DIR / "router.pid"
+# This must cover the router's upstream readiness wait as well as HTTP startup.
+ROUTER_START_TIMEOUT = _env_float("CX_ROUTER_START_TIMEOUT", default=35.0, minimum=0.1)
+ROUTER_COOLDOWN_429 = _env_float("CX_ROUTER_COOLDOWN_429", default=60.0, minimum=1.0, maximum=1800.0)
+ROUTER_COOLDOWN_5XX = _env_float("CX_ROUTER_COOLDOWN_5XX", default=30.0, minimum=1.0, maximum=1800.0)
+ROUTER_COOLDOWN_NETWORK = _env_float("CX_ROUTER_COOLDOWN_NETWORK", default=10.0, minimum=1.0, maximum=1800.0)
+ROUTER_COOLDOWN_AUTH = _env_float("CX_ROUTER_COOLDOWN_AUTH", default=300.0, minimum=1.0, maximum=1800.0)
+ROUTER_COOLDOWN_PACED_429 = _env_float("CX_ROUTER_COOLDOWN_PACED_429", default=10.0, minimum=1.0, maximum=1800.0)
 
 DEFAULT_GPT_FAST_MODEL = _env("CX_GPT_FAST_MODEL", default="")
 DEFAULT_GPT_MEDIUM_MODEL = _env("CX_GPT_MEDIUM_MODEL", default="")

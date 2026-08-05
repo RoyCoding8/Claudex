@@ -72,23 +72,13 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 ## Router semantics
 
-- **Selection**. Strict priority tiers: the router only considers members at the lowest priority
-  number available. Within a tier, it picks weighted-random by `rpm`. A member missing `priority`
-  falls to the *default* tier (`0`); missing `rpm` defaults to `1`.
-- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response,
-  network error, or first SSE `error` event cools that backend and tries the next member. `401`/`403`
-  use the authentication cooldown; `429` honors `Retry-After`; other `4xx`, `5xx`, and unexpected
-  statuses use the upstream-failure cooldown. The budget is `min(pool_size, 8)` attempts.
-- **Cooldown**. `429` cools by `Retry-After` if provided else 60s; `5xx` cools 30s; a network
-  error cools 10s; provider authentication failures cool 300s. Cooldown is keyed by the real
-  backend model, so if the same backend appears in multiple pools its cooldown is shared.
-- **Streaming**. SSE is forwarded incrementally via `HTTPResponse.read1()` — no buffering. Once
-  any bytes have been forwarded to the client, retries are not attempted (they can't be, safely).
-- **Passthrough**. If the incoming `model` field is not one of your enabled pool names, the
-  request is forwarded unchanged. Pooled `count_tokens` requests use the same failover policy.
-- **Errors**. Non-pooled requests preserve upstream responses unchanged. For a pool, every member
-  rejection is retried within the bounded attempt budget; if all members fail, the router returns a
-  sanitized `503` summary without upstream bodies or keys.
+- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`.
+- **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member is deprioritized so another candidate can serve the request instead of burning a `429`. The sliding window ages out on its own, so the member becomes preferred again when its oldest request falls out of it.
+- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or an initial SSE `error` **frame envelope** cools that backend and tries the next member. The router parses only the first complete SSE envelope (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It tries every pool member once, in priority order, unless the 120-second request-wide deadline is hit.
+- **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.
+- **Streaming**. SSE remains incremental via `HTTPResponse.read1()` and is never fully buffered. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event and logged. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
+- **Passthrough**. If the incoming `model` field is not one of your enabled pool names, the request is forwarded unchanged. Pooled `count_tokens` requests use the same failover policy.
+- **Errors**. Non-pooled requests preserve upstream responses unchanged. A pool returns a sanitized `503` only after every member was attempted or the request deadline expired. The response includes a correlation `request_id`; upstream error bodies are logged locally (bounded) and are never returned to Claude Code.
 
 ## Endpoints
 
@@ -120,7 +110,7 @@ in `.env`; this file only configures local traffic. `.env` is git-ignored.
 Router:
 - `CX_ROUTER_HOST`, `CX_ROUTER_PORT`, `CX_ROUTER_API_KEY`
 - `CX_ROUTER_COOLDOWN_429`, `CX_ROUTER_COOLDOWN_5XX`, `CX_ROUTER_COOLDOWN_NETWORK`,
-  `CX_ROUTER_COOLDOWN_AUTH` (seconds, clamped to 1–1800)
+  `CX_ROUTER_COOLDOWN_AUTH`, `CX_ROUTER_COOLDOWN_PACED_429` (seconds, clamped to 1–1800)
 - Legacy aliases still accepted: `CX_LITELLM_HOST`, `CX_LITELLM_PORT`, `CX_LITELLM_API_KEY`
 
 CLIProxyAPI:

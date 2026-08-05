@@ -9,13 +9,12 @@ __pycache__/
 # Virtual environments
 .venv/
 
-# Local secrets / configuration. .env.example is a tracked template; the real
-# .env is local-only and may hold local API keys and machine-specific paths.
+# Local secrets
 .env
 .env.*
 !.env.example
 
-# Local configuration and runtime state. Tracked *.example.json files are safe templates.
+# Local configuration and runtime state.
 data/pools.json
 data/settings.json
 data/*.broken_*.json
@@ -23,6 +22,7 @@ data/*.log
 data/*.pid
 data/*.err
 data/*.tmp
+tmp/
 
 # Editors
 .idea/

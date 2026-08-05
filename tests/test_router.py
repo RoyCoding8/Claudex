@@ -16,6 +16,7 @@ from modules.router import (
     _Member,
     _Pool,
     _PoolRegistry,
+    _RateLimiter,
     _RouterServer,
     _parse_pools,
     _pick_member,
@@ -69,6 +70,11 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
         type(self).stream_gate.wait(timeout=3)
         for chunk in body[1:]:
+            if chunk == b"__drop__":
+                # A declared Content-Length plus an early close makes the
+                # client observe a real mid-body read failure.
+                self.connection.close()
+                return
             self.wfile.write(chunk)
             self.wfile.flush()
 
@@ -76,6 +82,7 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
 @contextmanager
 def _running_router(
     *responses: tuple[int, dict[str, str], bytes | tuple[bytes, ...]],
+    members: list[dict[str, object]] | None = None,
 ):
     _UpstreamHandler.responses = deque(responses)
     _UpstreamHandler.models = []
@@ -84,6 +91,11 @@ def _running_router(
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
+
+    member_specs = members or [
+        {"model": "provider/first", "priority": 1},
+        {"model": "provider/second", "priority": 2},
+    ]
 
     with tempfile.TemporaryDirectory() as temporary:
         pools_file = Path(temporary) / "pools.json"
@@ -94,10 +106,7 @@ def _running_router(
                     "pools": [
                         {
                             "name": "test-pool",
-                            "members": [
-                                {"model": "provider/first", "priority": 1},
-                                {"model": "provider/second", "priority": 2},
-                            ],
+                            "members": member_specs,
                         }
                     ],
                 }
@@ -188,13 +197,14 @@ class PickMemberTests(unittest.TestCase):
         pool = _mk_pool(("a", 1, 1), ("b", 1, 2))
         cd = _CooldownTable()
         cd.cooldown("a", 30, "test")
+        # A ready alternative is preferred before a last-resort cooling retry.
         self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "b")
 
-    def test_returns_none_when_all_cooling_and_excluded(self) -> None:
+    def test_all_cooling_remains_selectable(self) -> None:
         pool = _mk_pool(("a", 1, 1))
         cd = _CooldownTable()
         cd.cooldown("a", 30, "test")
-        self.assertIsNone(_pick_member(pool, cd, exclude=set()))
+        self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "a")
 
     def test_rpm_weight_within_tier(self) -> None:
         # 999-vs-1 rpm; picking 400 times should heavily favour the 999 member
@@ -207,7 +217,76 @@ class PickMemberTests(unittest.TestCase):
         self.assertGreater(counts["heavy"], counts["light"] * 20)
 
 
-class BodyRewriteTests(unittest.TestCase):
+def _mk_pool_limited(*members: tuple[str, int, int, int | None]) -> _Pool:
+    """members: (model, rpm, priority, limit) — limit may be None."""
+    return _Pool(
+        name="p",
+        members=tuple(
+            _Member(model=m, rpm=r, priority=p, limit=lim)
+            for m, r, p, lim in members
+        ),
+    )
+
+
+class PacingTests(unittest.TestCase):
+    def test_unpaced_member_is_not_limited(self) -> None:
+        pool = _mk_pool_limited(("a", 1, 1, None), ("b", 1, 2, None))
+        cd = _CooldownTable()
+        lim = _RateLimiter()
+        for _ in range(150):
+            m = _pick_member(pool, cd, exclude=set(), limiter=lim)
+            lim.record(m.model, m.limit)
+        # top priority always chosen, never paced out
+        self.assertEqual(cd.is_ready("a"), True)
+        self.assertEqual(
+            _pick_member(pool, cd, exclude=set(), limiter=lim).model, "a"
+        )
+
+    def test_paced_top_member_spills_to_next_tier(self) -> None:
+        pool = _mk_pool_limited(("fast", 1, 1, 2), ("slow", 1, 2, None))
+        cd = _CooldownTable()
+        lim = _RateLimiter()
+        chosen: list[str] = []
+        # two dispatches fit within the limit; subsequent ones must spill
+        for _ in range(6):
+            m = _pick_member(pool, cd, exclude=set(), limiter=lim)
+            chosen.append(m.model)
+            lim.record(m.model, m.limit)
+        self.assertEqual(chosen[:2], ["fast", "fast"])
+        # after the limit is hit, traffic spills to the lower-priority member
+        self.assertIn("slow", chosen[2:])
+        self.assertNotIn("fast", chosen[2:])
+
+    def test_all_paced_out_falls_back_to_top_priority(self) -> None:
+        # if every member is paced out, the router must still pick someone
+        # rather than fail the request; the highest-priority one wins.
+        pool = _mk_pool_limited(("a", 1, 1, 1), ("b", 1, 2, 1))
+        cd = _CooldownTable()
+        lim = _RateLimiter()
+        lim.record("a", 1)
+        lim.record("b", 1)
+        self.assertEqual(
+            _pick_member(pool, cd, exclude=set(), limiter=lim).model, "a"
+        )
+
+    def test_window_expiry_restores_capacity(self) -> None:
+        pool = _mk_pool_limited(("fast", 1, 1, 1), ("slow", 1, 2, None))
+        cd = _CooldownTable()
+        lim = _RateLimiter()
+        # exhaust the fast member's lone slot
+        lim.record("fast", 1)
+        # fast is paced out, so traffic spills to the lower-priority member
+        self.assertEqual(
+            _pick_member(pool, cd, exclude=set(), limiter=lim).model, "slow"
+        )
+        # after the 60s window passes, the fast member regains capacity
+        with patch("modules.router.time.monotonic", return_value=99999.0):
+            self.assertEqual(
+                _pick_member(pool, cd, exclude=set(), limiter=lim).model, "fast"
+            )
+
+
+class ModelRewriteTests(unittest.TestCase):
     def test_only_top_level_model_field_is_replaced(self) -> None:
         body = json.dumps(
             {
@@ -436,6 +515,48 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body, error_body)
         self.assertEqual(_UpstreamHandler.models, ["provider/direct"])
+
+    def test_paced_member_429_uses_short_cooldown(self) -> None:
+        # A member with an rpm cap should cool for the short paced-429 value,
+        # not the global 60s default, so it comes back within the same minute.
+        members = [
+            {"model": "provider/first", "priority": 1, "rpm": 40},
+            {"model": "provider/second", "priority": 2},
+        ]
+        with _running_router(
+            (429, {}, b'{"error":{"message":"Rate limit exceeded"}}'),
+            (200, {}, b'{"ok":true}'),
+            members=members,
+        ) as router:
+            first_status, _ = _post(router)
+            self.assertEqual(first_status, 200)
+            self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+
+            # the paced member was put into a short cooldown on the 429
+            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+
+            with patch("modules.router.time.monotonic", return_value=99999.0):
+                # after the short cooldown elapses it must be eligible again
+                self.assertTrue(router.cooldowns.is_ready("provider/first"))
+
+    def test_provider_retry_after_overrides_paced_cooldown(self) -> None:
+        # If the provider sends its own Retry-After, that wins over the paced
+        # default — we trust the server's knowledge of its own window.
+        members = [
+            {"model": "provider/first", "priority": 1, "rpm": 40},
+            {"model": "provider/second", "priority": 2},
+        ]
+        with _running_router(
+            (429, {"Retry-After": "2"}, b'{"error":{"message":"Rate limit"}}'),
+            (200, {}, b'{"ok":true}'),
+            members=members,
+        ) as router:
+            status, _ = _post(router)
+            self.assertEqual(status, 200)
+            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+            # provider said 2s, so it stays cooled at t+1
+            with patch("modules.router.time.monotonic", return_value=1.0):
+                self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
 
 if __name__ == "__main__":
