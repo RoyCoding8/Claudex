@@ -13,7 +13,7 @@ Claude Code → cx router :4000 → CLIProxyAPI :8317 → providers
   routing, retries, and cooldowns. It speaks Claude Code's Anthropic `/v1/messages` protocol and
   passes everything else through unchanged.
 
-The router is a single-file, stdlib-only Python service (~740 lines). The launcher adds two small
+The router is a single-file, stdlib-only Python service (~870 lines). The launcher adds two small
 runtime dependencies: `prompt-toolkit` for the TUI and `python-dotenv` for optional `.env` loading.
 It boots in ~250ms and requires no build step.
 
@@ -73,11 +73,12 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 ## Router semantics
 
-- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. A pool with `"strategy": "round-robin"` instead cycles through its members evenly in config order — priority tiers and `rpm` weights are ignored, while the availability preferences above still apply.
+- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. A pool with `"strategy": "round-robin"` instead cycles through its members evenly in config order — priority tiers and `rpm` weights are ignored, while the availability preferences above still apply. The rotation cursor tracks member *identity* and advances once per request, parking just past whichever member was actually dispatched: a member that served a retry is not handed the next request as well, and a member skipped while cooling reclaims its own slot once it recovers.
 - **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member is deprioritized so another candidate can serve the request instead of burning a `429`. The sliding window ages out on its own, so the member becomes preferred again when its oldest request falls out of it.
-- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or an initial SSE `error` **frame envelope** cools that backend and tries the next member. The router parses only the first complete SSE envelope (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It tries every pool member once, in priority order, unless the 120-second request-wide deadline is hit.
+- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or SSE `error` **frame envelope** seen before the commit point cools that backend and tries the next member. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It tries every pool member once, in priority order, unless the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`) is hit; each attempt's upstream wait is clamped to what remains of that budget.
+- **Empty responses**. A `200` carrying no usable content is a failure, not an answer: zero bytes, no complete SSE frame, an unparseable body, `{}`, `{"content": []}`, or a stream that reaches `message_stop` without a single content block. Any of these cools the member (20 s, `CX_ROUTER_COOLDOWN_EMPTY`) and fails over, so a flaky provider returning empties can no longer stall Claude Code. `count_tokens` is exempt from the content check — its success body legitimately has none.
 - **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.
-- **Streaming**. SSE remains incremental via `HTTPResponse.read1()` and is never fully buffered. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event and logged. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
+- **Streaming**. The router holds an SSE response until it proves it carries content — the first `content_block_start`/`content_block_delta` — then replays the buffered head and streams the rest incrementally via `HTTPResponse.read1()`. Committing therefore costs only the provider's real time-to-first-token, and the client still receives the stream from its very first frame. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event, logged, and cools the member so the next request avoids it. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
 - **Passthrough**. If the incoming `model` field is not one of your enabled pool names, the request is forwarded unchanged. Pooled `count_tokens` requests use the same failover policy.
 - **Errors**. Non-pooled requests preserve upstream responses unchanged. A pool returns a sanitized `503` only after every member was attempted or the request deadline expired. The response includes a correlation `request_id`; upstream error bodies are logged locally (bounded) and are never returned to Claude Code.
 
@@ -111,7 +112,10 @@ in `.env`; this file only configures local traffic. `.env` is git-ignored.
 Router:
 - `CX_ROUTER_HOST`, `CX_ROUTER_PORT`, `CX_ROUTER_API_KEY`
 - `CX_ROUTER_COOLDOWN_429`, `CX_ROUTER_COOLDOWN_5XX`, `CX_ROUTER_COOLDOWN_NETWORK`,
-  `CX_ROUTER_COOLDOWN_AUTH`, `CX_ROUTER_COOLDOWN_PACED_429` (seconds, clamped to 1–1800)
+  `CX_ROUTER_COOLDOWN_AUTH`, `CX_ROUTER_COOLDOWN_PACED_429`, `CX_ROUTER_COOLDOWN_EMPTY`
+  (seconds, clamped to 1–1800)
+- `CX_ROUTER_POOL_TIMEOUT` (seconds, default 180) — whole-request budget shared by every
+  failover attempt
 - Legacy aliases still accepted: `CX_LITELLM_HOST`, `CX_LITELLM_PORT`, `CX_LITELLM_API_KEY`
 
 CLIProxyAPI:

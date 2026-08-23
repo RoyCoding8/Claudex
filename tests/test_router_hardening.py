@@ -5,7 +5,9 @@ import unittest
 from unittest.mock import patch
 
 from modules.router import _CooldownTable, _Member, _Pool, _RateLimiter, _pick_member, _sse_frame_is_error
-from tests.test_router import _UpstreamHandler, _post, _running_router
+from tests.test_router import (
+    _DELTA, _OK_BODY, _SSE, _START, _UpstreamHandler, _post, _running_router,
+)
 
 
 class RouterHardeningTests(unittest.TestCase):
@@ -50,7 +52,7 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(_UpstreamHandler.models, [member["model"] for member in members])
 
     def test_non_streaming_response_has_content_length(self) -> None:
-        with _running_router((200, {}, b'{"ok":true}')) as router:
+        with _running_router((200, {}, _OK_BODY)) as router:
             import http.client
             body = json.dumps({"model": "test-pool", "messages": []}).encode()
             connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=3)
@@ -69,15 +71,26 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(_pick_member(pool, cooldowns, set(), _RateLimiter()).model, "first")
 
     def test_later_stream_error_is_forwarded_and_logged(self) -> None:
-        first = b'event: message_start\ndata: {"type":"message_start"}\n\n'
+        # Post-commit the bytes are already gone; all the router can do is
+        # forward, log, and park the member so the next request avoids it.
+        head = _START + _DELTA
         error = b'event: error\ndata: {"type":"error","error":{"message":"late"}}\n\n'
-        with _running_router((200, {"Content-Type": "text/event-stream"}, (first, error))) as router:
+        with _running_router((200, _SSE, (head, error))) as router:
             _UpstreamHandler.stream_gate.set()
             with self.assertLogs("cx.router", level="WARNING") as logs:
                 status, received = _post(router)
+            self.assertFalse(router.cooldowns.is_ready("provider/first"))
         self.assertEqual(status, 200)
-        self.assertEqual(received, first + error)
+        self.assertEqual(received, head + error)
         self.assertTrue(any("trailing SSE error" in line for line in logs.output))
+
+    def test_stream_error_before_content_never_reaches_the_client(self) -> None:
+        error = b'event: error\ndata: {"type":"error","error":{"message":"early"}}\n\n'
+        with _running_router((200, _SSE, _START + error), (200, {}, _OK_BODY)) as router:
+            status, received = _post(router)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"early", received)
+        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
 
     def test_peek_socket_reset_returns_sanitized_json_error(self) -> None:
         with _running_router((0, {}, b"")) as router:
@@ -86,12 +99,15 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(json.loads(received)["error"]["type"], "pool_exhausted")
 
     def test_midstream_upstream_drop_emits_final_error_event(self) -> None:
-        first = b'event: message_start\ndata: {"type":"message_start"}\n\n'
-        with _running_router((200, {"Content-Type": "999", "Content-Type": "text/event-stream", "Content-Length": "999"}, (first, b"__drop__"))) as router:
+        # A drop after the commit point is unrecoverable: the client keeps the
+        # partial answer plus a terminal error event, and the member is parked.
+        head = _START + _DELTA
+        with _running_router((200, {**_SSE, "Content-Length": "999"}, (head, b"__drop__"))) as router:
             _UpstreamHandler.stream_gate.set()
             status, received = _post(router)
+            self.assertFalse(router.cooldowns.is_ready("provider/first"))
         self.assertEqual(status, 200)
-        self.assertTrue(received.startswith(first))
+        self.assertTrue(received.startswith(head))
         self.assertIn(b'event: error', received)
 
 

@@ -28,22 +28,26 @@ from urllib.parse import urlsplit
 from .config import (
     POOLS_FILE, PROXY_API_KEY, PROXY_HOST, PROXY_PORT, ROUTER_API_KEY,
     ROUTER_COOLDOWN_429, ROUTER_COOLDOWN_5XX, ROUTER_COOLDOWN_AUTH,
-    ROUTER_COOLDOWN_NETWORK, ROUTER_COOLDOWN_PACED_429, ROUTER_HOST,
-    ROUTER_LOG, ROUTER_PORT, ROUTER_START_TIMEOUT,
+    ROUTER_COOLDOWN_EMPTY, ROUTER_COOLDOWN_NETWORK, ROUTER_COOLDOWN_PACED_429,
+    ROUTER_HOST, ROUTER_LOG, ROUTER_POOL_TIMEOUT, ROUTER_PORT,
+    ROUTER_START_TIMEOUT,
 )
 
 _UPSTREAM_TIMEOUT = 600.0
 _UPSTREAM_HEADER_TIMEOUT = 60.0
-_POOL_REQUEST_TIMEOUT = 120.0
+_POOL_REQUEST_TIMEOUT = ROUTER_POOL_TIMEOUT
 _MODELS_CACHE_TTL = 30.0
 _POOLS_STAT_INTERVAL = 0.25
 _ERROR_PEEK_BYTES = 16 * 1024
+_HEAD_PEEK_BYTES = 256 * 1024
 _COOLDOWN_ON_429_DEFAULT = ROUTER_COOLDOWN_429
 _COOLDOWN_ON_5XX = ROUTER_COOLDOWN_5XX
 _COOLDOWN_ON_NETERR = ROUTER_COOLDOWN_NETWORK
 _COOLDOWN_ON_AUTH = ROUTER_COOLDOWN_AUTH
 _COOLDOWN_ON_PACED_429 = ROUTER_COOLDOWN_PACED_429
+_COOLDOWN_ON_EMPTY = ROUTER_COOLDOWN_EMPTY
 _AUTH_STATUS = frozenset({401, 403})
+_CONTENT_EVENTS = frozenset({"content_block_start", "content_block_delta"})
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
@@ -227,29 +231,42 @@ def _weighted_choice(members: list[_Member]) -> _Member:
 
 
 class _Rotation:
+    """Per-pool cursor over member *identity*, resumed after the last dispatch.
+
+    Indexing the pool's own member tuple — rather than a filtered candidate
+    list whose length changes with cooldowns and retries — is what keeps the
+    rotation phase meaningful across requests.
+    """
     def __init__(self) -> None:
-        self._cursors: dict[str, int] = {}
+        self._state: dict[str, tuple[int, int]] = {}
         self._lock = threading.Lock()
 
-    def take(self, pool: str) -> int:
+    def start(self, pool: str, size: int) -> int:
         with self._lock:
-            index = self._cursors.get(pool, 0)
-            self._cursors[pool] = index + 1
-            return index
+            known, cursor = self._state.get(pool, (size, 0))
+            return cursor if known == size else 0
+
+    def settle(self, pool: str, size: int, index: int) -> None:
+        """Park the cursor just past the member actually dispatched."""
+        if size > 0:
+            with self._lock:
+                self._state[pool] = (size, (index + 1) % size)
 
 
 def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
                  limiter: _RateLimiter | None = None,
-                 rotation: _Rotation | None = None) -> _Member | None:
+                 start: int | None = None) -> _Member | None:
     """Choose one untried member without letting cooldowns suppress fallback.
 
     Availability is selected before anything else: ready/unpaced members are
     preferred, followed by paced members, then cooling members. Within that,
     fill-first pools drain strict priority tiers (weighted-random by rpm inside
-    a tier) while round-robin pools ignore tiers and weights, cycling through
-    members in config order. Therefore a pool only reports exhaustion after
-    every distinct member has genuinely been dispatched.
+    a tier) while round-robin pools ignore tiers and weights, scanning from the
+    rotation cursor in config order. Therefore a pool only reports exhaustion
+    after every distinct member has genuinely been dispatched.
     """
+    if pool.strategy == "round-robin":
+        return _rotate_member(pool, cooldowns, exclude, limiter, start or 0)
     candidates = [member for member in pool.members if member.model not in exclude]
     if not candidates:
         return None
@@ -262,11 +279,24 @@ def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
         # Every untried member is cooling. Cooldown is a last-resort preference,
         # never a hard exclusion.
         selected = candidates
-    if pool.strategy == "round-robin":
-        cursor = rotation.take(pool.name) if rotation is not None else 0
-        return selected[cursor % len(selected)]
     top = min(member.priority for member in selected)
     return _weighted_choice([member for member in selected if member.priority == top])
+
+
+def _rotate_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
+                   limiter: _RateLimiter | None, start: int) -> _Member | None:
+    size = len(pool.members)
+    order = [pool.members[(start + offset) % size] for offset in range(size)]
+    order = [member for member in order if member.model not in exclude]
+    tiers = (
+        lambda m: cooldowns.is_ready(m.model) and (limiter is None or limiter.has_capacity(m.model, m.limit)),
+        lambda m: cooldowns.is_ready(m.model),
+        lambda m: True,
+    )
+    for accepts in tiers:
+        if member := next((m for m in order if accepts(m)), None):
+            return member
+    return None
 
 
 @dataclass(slots=True)
@@ -276,7 +306,16 @@ class _UpstreamResponse:
     headers: list[tuple[str, str]]
     body_iter: Iterable[bytes]
     connection: HTTPConnection
+    body_socket: Any = None
     _closed: bool = False
+
+    def relax_timeout(self) -> None:
+        """Head validation reads on a short leash; a committed body needs the long one."""
+        if self.body_socket is not None:
+            try:
+                self.body_socket.settimeout(_UPSTREAM_TIMEOUT)
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._closed:
@@ -288,19 +327,22 @@ class _UpstreamResponse:
             pass
 
 
-def _forward_to_upstream(method: str, path: str, headers: dict[str, str], body: bytes) -> _UpstreamResponse:
-    conn = HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=_UPSTREAM_TIMEOUT)
+def _forward_to_upstream(method: str, path: str, headers: dict[str, str], body: bytes,
+                         deadline: float | None = None) -> _UpstreamResponse:
+    # One stalled member must not swallow the whole pooled-request budget.
+    leash = _UPSTREAM_TIMEOUT if deadline is None else max(1.0, deadline - time.monotonic())
+    conn = HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=min(_UPSTREAM_TIMEOUT, leash))
     try:
         conn.request(method, path, body=body, headers=headers)
         if conn.sock is not None:
-            conn.sock.settimeout(_UPSTREAM_HEADER_TIMEOUT)
+            conn.sock.settimeout(min(_UPSTREAM_HEADER_TIMEOUT, leash))
         response = conn.getresponse()
     except BaseException:
         conn.close()
         raise
     body_socket = conn.sock or getattr(getattr(response.fp, "raw", None), "_sock", None)
     if body_socket is not None:
-        body_socket.settimeout(_UPSTREAM_TIMEOUT)
+        body_socket.settimeout(min(_UPSTREAM_HEADER_TIMEOUT, leash))
 
     def iterate() -> Iterable[bytes]:
         try:
@@ -320,7 +362,7 @@ def _forward_to_upstream(method: str, path: str, headers: dict[str, str], body: 
 
     return _UpstreamResponse(response.status, response.reason or "", [
         (key, value) for key, value in response.getheaders() if key.lower() not in _HOP_BY_HOP
-    ], iterate(), conn)
+    ], iterate(), conn, body_socket)
 
 
 class _ModelListCache:
@@ -451,29 +493,37 @@ class _RouterHandler(BaseHTTPRequestHandler):
         rotation: _Rotation = self.server.rotation  # type: ignore[attr-defined]
         request_id = uuid.uuid4().hex[:12]
         deadline = time.monotonic() + _POOL_REQUEST_TIMEOUT
+        size = len(pool.members)
+        start = rotation.start(pool.name, size)
+        distinct = len({member.model for member in pool.members})
         tried: set[str] = set()
         failures: list[dict[str, Any]] = []
         attempt = 0
-        while len(tried) < len(pool.members) and time.monotonic() < deadline:
-            member = _pick_member(pool, cooldowns, tried, limiter, rotation)
+        while len(tried) < distinct and time.monotonic() < deadline:
+            member = _pick_member(pool, cooldowns, tried, limiter, start)
             if member is None:
                 break
             attempt += 1
             tried.add(member.model)
             limiter.record(member.model, member.limit)
+            rotation.settle(pool.name, size, next(
+                index for index, m in enumerate(pool.members) if m.model == member.model))
             rewritten = _rewrite_model(body, payload, member.model)
             _LOG.info("request=%s attempt=%d pool=%s member=%s", request_id, attempt, pool.name, member.model)
             try:
-                upstream = _forward_to_upstream("POST", path, _upstream_headers(self.headers, rewritten), rewritten)
-                retry = _classify_retry(upstream)
+                upstream = _forward_to_upstream(
+                    "POST", path, _upstream_headers(self.headers, rewritten), rewritten, deadline)
+                retry = _classify_retry(upstream, path=path, deadline=deadline)
             except (OSError, HTTPException) as error:
                 cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "network")
                 failures.append({"category": "network"})
                 _LOG.warning("request=%s pool=%s member=%s category=network error=%s", request_id, pool.name, member.model, error)
                 continue
             if retry is None:
-                cooldowns.clear(member.model)
-                self._stream_upstream(upstream, request_id=request_id, member=member.model)
+                if self._stream_upstream(upstream, request_id=request_id, member=member.model):
+                    cooldowns.clear(member.model)
+                else:
+                    cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "stream_drop")
                 return
             category, delay = retry
             if category == "rate_limit":
@@ -490,7 +540,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 "request=%s pool=%s member=%s status=%d category=%s cooldown=%.1fs upstream=%r",
                 request_id, pool.name, member.model, upstream.status, category, delay, prefix,
             )
-        timed_out = time.monotonic() >= deadline and len(tried) < len(pool.members)
+        timed_out = time.monotonic() >= deadline and len(tried) < distinct
         _LOG.warning("request=%s pool=%s exhausted attempts=%d timed_out=%s", request_id, pool.name, len(tried), timed_out)
         self._send_json(503, {"error": {
             "message": "router: no pool member succeeded", "type": "pool_exhausted",
@@ -537,7 +587,9 @@ class _RouterHandler(BaseHTTPRequestHandler):
             pass
 
     def _stream_upstream(self, upstream: _UpstreamResponse, *, request_id: str | None = None,
-                         member: str | None = None) -> None:
+                         member: str | None = None) -> bool:
+        """Forward a committed response; False means the member let the body down."""
+        upstream.relax_timeout()
         streaming = _is_event_stream(upstream.headers)
         try:
             if not streaming:
@@ -548,7 +600,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 except (OSError, HTTPException) as error:
                     _LOG.warning("request=%s member=%s upstream body failed before response: %s", request_id, member, error)
                     self._send_json(502, {"error": {"message": "router: upstream response interrupted"}})
-                    return
+                    return False
                 body = b"".join(chunks)
                 self._send_upstream_headers(upstream, len(body))
                 try:
@@ -556,9 +608,9 @@ class _RouterHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
-                return
+                return True
             self._send_upstream_headers(upstream, None)
-            sent = False
+            sent, clean = False, True
             sse_buffer = b""
             try:
                 for chunk in upstream.body_iter:
@@ -569,6 +621,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
                     while b"\n\n" in sse_buffer:
                         frame, sse_buffer = sse_buffer.split(b"\n\n", 1)
                         if _sse_frame_is_error(frame):
+                            clean = False
                             _LOG.warning("request=%s member=%s forwarded trailing SSE error", request_id, member)
             except (OSError, HTTPException) as error:
                 _LOG.warning("request=%s member=%s upstream SSE interrupted after_bytes=%s: %s", request_id, member, sent, error)
@@ -577,8 +630,10 @@ class _RouterHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                return False
             except (BrokenPipeError, ConnectionResetError):
-                return
+                return True
+            return clean
         finally:
             upstream.close()
 
@@ -646,49 +701,96 @@ def _retry_after_seconds(headers: list[tuple[str, str]], default: float) -> floa
     return default
 
 
-def _peek_sse_frame(upstream: _UpstreamResponse) -> bytes:
-    """Inspect only the first complete SSE envelope and preserve all bytes."""
-    iterator, chunks, total = iter(upstream.body_iter), [], 0
-    try:
-        while total < _ERROR_PEEK_BYTES:
-            chunk = next(iterator)
-            chunks.append(chunk)
-            total += len(chunk)
-            joined = b"".join(chunks)
-            boundary = joined.find(b"\n\n")
-            if boundary >= 0:
-                upstream.body_iter = chain(chunks, iterator)
-                return joined[:boundary]
-    except StopIteration:
-        pass
-    upstream.body_iter = chain(chunks, iterator)
-    return b""
-
-
-def _sse_frame_is_error(frame: bytes) -> bool:
-    event = ""
-    data_lines: list[str] = []
+def _sse_event(frame: bytes) -> str:
+    """Name one SSE envelope by its `event:` line, falling back to `data.type`."""
+    event, data_lines = "", []
     for line in frame.decode("utf-8", errors="replace").replace("\r\n", "\n").split("\n"):
         if line.startswith("event:"):
             event = line[6:].strip()
         elif line.startswith("data:"):
             data_lines.append(line[5:].lstrip())
-    if event == "error":
-        return True
-    if not data_lines:
-        return False
+    if event:
+        return event
     try:
-        payload = json.loads("\n".join(data_lines))
+        payload = json.loads("\n".join(data_lines)) if data_lines else None
     except json.JSONDecodeError:
-        return False
-    return isinstance(payload, dict) and payload.get("type") == "error"
+        return ""
+    return str(payload.get("type") or "") if isinstance(payload, dict) else ""
 
 
-def _classify_retry(upstream: _UpstreamResponse) -> tuple[str, float] | None:
-    if 200 <= upstream.status < 300:
-        if _is_event_stream(upstream.headers) and _sse_frame_is_error(_peek_sse_frame(upstream)):
-            return "stream_error", _COOLDOWN_ON_5XX
+def _sse_frame_is_error(frame: bytes) -> bool:
+    return _sse_event(frame) == "error"
+
+
+_HEAD_VERDICTS = {
+    "error": ("stream_error", _COOLDOWN_ON_5XX),
+    "message_stop": ("empty", _COOLDOWN_ON_EMPTY),
+}
+
+
+def _validate_stream_head(upstream: _UpstreamResponse, deadline: float) -> tuple[str, float] | None:
+    """Hold an SSE response until it proves it carries content.
+
+    Every byte read here is re-chained onto ``body_iter``, so committing costs
+    nothing: the client still receives the stream from its very first frame.
+    Hitting the byte cap or the request deadline commits rather than stalls.
+    """
+    iterator, chunks, buffered, total = iter(upstream.body_iter), [], b"", 0
+    outcome: tuple[str, float] | None = None
+    try:
+        while total < _HEAD_PEEK_BYTES and time.monotonic() < deadline:
+            chunk = next(iterator)
+            chunks.append(chunk)
+            total += len(chunk)
+            buffered += chunk
+            events = []
+            while b"\n\n" in buffered:
+                frame, buffered = buffered.split(b"\n\n", 1)
+                events.append(_sse_event(frame))
+            # Content anywhere in this batch wins: a later error frame is then
+            # post-commit, forwarded and flagged by the streaming loop instead.
+            if any(event in _CONTENT_EVENTS for event in events):
+                break
+            if outcome := next((_HEAD_VERDICTS[e] for e in events if e in _HEAD_VERDICTS), None):
+                break
+    except StopIteration:
+        outcome = "empty", _COOLDOWN_ON_EMPTY
+    except (OSError, HTTPException):
+        outcome = "truncated", _COOLDOWN_ON_NETERR
+    upstream.body_iter = chain(chunks, iterator)
+    return outcome
+
+
+def _validate_body(upstream: _UpstreamResponse, path: str) -> tuple[str, float] | None:
+    """Judge a non-SSE 2xx while failover is still possible."""
+    upstream.relax_timeout()
+    try:
+        body = b"".join(upstream.body_iter)
+    except (OSError, HTTPException):
+        return "truncated", _COOLDOWN_ON_NETERR
+    upstream.body_iter = iter((body,))
+    if not body.strip():
+        return "empty", _COOLDOWN_ON_EMPTY
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return "malformed", _COOLDOWN_ON_EMPTY
+    if not isinstance(payload, dict):
+        return "malformed", _COOLDOWN_ON_EMPTY
+    # count_tokens answers with {"input_tokens": N} and never carries content.
+    if path.endswith("/count_tokens"):
         return None
+    content = payload.get("content")
+    if not isinstance(content, list) or not content:
+        return "empty", _COOLDOWN_ON_EMPTY
+    return None
+
+
+def _classify_retry(upstream: _UpstreamResponse, *, path: str, deadline: float) -> tuple[str, float] | None:
+    if 200 <= upstream.status < 300:
+        if _is_event_stream(upstream.headers):
+            return _validate_stream_head(upstream, deadline)
+        return _validate_body(upstream, path)
     if upstream.status == 429:
         return "rate_limit", _retry_after_seconds(upstream.headers, _COOLDOWN_ON_429_DEFAULT)
     if upstream.status in _AUTH_STATUS:
