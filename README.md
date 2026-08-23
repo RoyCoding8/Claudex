@@ -49,7 +49,8 @@ Press **F7** in the model picker to create cross-provider pools:
 2. Add ≥ 2 provider-specific model IDs (`nvidia_nim/z-ai/glm-5.2`, `vercel/zai/glm-5.2`, …).
 3. Set the real RPM/TPM limit per member. If unsure, leave blank (auto).
 4. Optionally set a priority per member (lower number = tried first).
-5. Save and return to the picker.
+5. Pick a routing strategy: `fill-first` (default) or `round-robin`.
+6. Save and return to the picker.
 
 Pool definitions live in `data/pools.json`. The router reloads them automatically on every request
 via `mtime`, so edits take effect without restarting anything.
@@ -72,7 +73,7 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 ## Router semantics
 
-- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`.
+- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. A pool with `"strategy": "round-robin"` instead cycles through its members evenly in config order — priority tiers and `rpm` weights are ignored, while the availability preferences above still apply.
 - **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member is deprioritized so another candidate can serve the request instead of burning a `429`. The sliding window ages out on its own, so the member becomes preferred again when its oldest request falls out of it.
 - **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or an initial SSE `error` **frame envelope** cools that backend and tries the next member. The router parses only the first complete SSE envelope (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It tries every pool member once, in priority order, unless the 120-second request-wide deadline is hit.
 - **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.

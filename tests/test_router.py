@@ -4,6 +4,7 @@ import http.client
 import json
 import tempfile
 import threading
+import time
 import unittest
 from collections import deque
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from modules.router import (
     _Pool,
     _PoolRegistry,
     _RateLimiter,
+    _Rotation,
     _RouterServer,
     _parse_pools,
     _pick_member,
@@ -26,11 +28,12 @@ from modules.router import (
 )
 
 
-def _mk_pool(*members: tuple[str, int, int]) -> _Pool:
+def _mk_pool(*members: tuple[str, int, int], strategy: str = "fill-first") -> _Pool:
     """members: (model, rpm, priority) triples."""
     return _Pool(
         name="p",
         members=tuple(_Member(model=m, rpm=r, priority=p) for m, r, p in members),
+        strategy=strategy,
     )
 
 
@@ -83,6 +86,7 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
 def _running_router(
     *responses: tuple[int, dict[str, str], bytes | tuple[bytes, ...]],
     members: list[dict[str, object]] | None = None,
+    strategy: str = "fill-first",
 ):
     _UpstreamHandler.responses = deque(responses)
     _UpstreamHandler.models = []
@@ -104,10 +108,11 @@ def _running_router(
                 {
                     "version": 1,
                     "pools": [
-                        {
-                            "name": "test-pool",
-                            "members": member_specs,
-                        }
+                    {
+                        "name": "test-pool",
+                        "strategy": strategy,
+                        "members": member_specs,
+                    }
                     ],
                 }
             ),
@@ -179,6 +184,12 @@ class ParsePoolsTests(unittest.TestCase):
         payload = {"pools": [{"name": "off", "enabled": False, "members": [{"model": "a/x"}]}]}
         self.assertEqual(_parse_pools(payload), {})
 
+    def test_strategy_parsed_with_fallback(self) -> None:
+        good = {"pools": [{"name": "p", "members": [{"model": "a/x"}], "strategy": "round-robin"}]}
+        self.assertEqual(_parse_pools(good)["p"].strategy, "round-robin")
+        bad = {"pools": [{"name": "p", "members": [{"model": "a/x"}], "strategy": "chaos"}]}
+        self.assertEqual(_parse_pools(bad)["p"].strategy, "fill-first")
+
 
 class PickMemberTests(unittest.TestCase):
     def test_strict_priority_tier(self) -> None:
@@ -215,6 +226,29 @@ class PickMemberTests(unittest.TestCase):
             m = _pick_member(pool, cd, exclude=set())
             counts[m.model] += 1
         self.assertGreater(counts["heavy"], counts["light"] * 20)
+
+
+class RoundRobinTests(unittest.TestCase):
+    def test_rotates_evenly_ignoring_tiers_and_weights(self) -> None:
+        pool = _mk_pool(("a", 1, 2), ("b", 999, 1), ("c", 1, 0), strategy="round-robin")
+        cd, rotation = _CooldownTable(), _Rotation()
+        picks = [_pick_member(pool, cd, set(), rotation=rotation).model for _ in range(6)]
+        self.assertEqual(picks, ["a", "b", "c", "a", "b", "c"])
+
+    def test_skips_cooling_member_in_rotation(self) -> None:
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="round-robin")
+        cd, rotation = _CooldownTable(), _Rotation()
+        cd.cooldown("a", 30, "test")
+        picks = [_pick_member(pool, cd, set(), rotation=rotation).model for _ in range(3)]
+        self.assertEqual(picks, ["b", "b", "b"])
+
+    def test_all_cooling_still_rotates(self) -> None:
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="round-robin")
+        cd, rotation = _CooldownTable(), _Rotation()
+        cd.cooldown("a", 30, "test")
+        cd.cooldown("b", 30, "test")
+        picks = [_pick_member(pool, cd, set(), rotation=rotation).model for _ in range(4)]
+        self.assertEqual(picks, ["a", "b", "a", "b"])
 
 
 def _mk_pool_limited(*members: tuple[str, int, int, int | None]) -> _Pool:
@@ -280,7 +314,8 @@ class PacingTests(unittest.TestCase):
             _pick_member(pool, cd, exclude=set(), limiter=lim).model, "slow"
         )
         # after the 60s window passes, the fast member regains capacity
-        with patch("modules.router.time.monotonic", return_value=99999.0):
+        # (relative to the live clock: a fixed epoch breaks on long uptimes)
+        with patch("modules.router.time.monotonic", return_value=time.monotonic() + 120.0):
             self.assertEqual(
                 _pick_member(pool, cd, exclude=set(), limiter=lim).model, "fast"
             )
@@ -507,6 +542,24 @@ class PoolFailoverTests(unittest.TestCase):
                     ["provider/first", "provider/second"],
                 )
 
+    def test_round_robin_alternates_members(self) -> None:
+        # Same default members (priority 1 / 2): fill-first would send every
+        # request to provider/first; round-robin must alternate instead.
+        with _running_router(
+            (200, {}, b'{"ok":true}'),
+            (200, {}, b'{"ok":true}'),
+            (200, {}, b'{"ok":true}'),
+            (200, {}, b'{"ok":true}'),
+            strategy="round-robin",
+        ) as router:
+            for _ in range(4):
+                status, _ = _post(router)
+                self.assertEqual(status, 200)
+        self.assertEqual(
+            _UpstreamHandler.models,
+            ["provider/first", "provider/second", "provider/first", "provider/second"],
+        )
+
     def test_non_pool_400_is_forwarded_unchanged(self) -> None:
         error_body = b'{"error":{"message":"direct model rejected request"}}'
         with _running_router((400, {}, error_body)) as router:
@@ -535,7 +588,7 @@ class PoolFailoverTests(unittest.TestCase):
             # the paced member was put into a short cooldown on the 429
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
-            with patch("modules.router.time.monotonic", return_value=99999.0):
+            with patch("modules.router.time.monotonic", return_value=time.monotonic() + 120.0):
                 # after the short cooldown elapses it must be eligible again
                 self.assertTrue(router.cooldowns.is_ready("provider/first"))
 
@@ -555,7 +608,7 @@ class PoolFailoverTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
             # provider said 2s, so it stays cooled at t+1
-            with patch("modules.router.time.monotonic", return_value=1.0):
+            with patch("modules.router.time.monotonic", return_value=time.monotonic() + 1.0):
                 self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
 

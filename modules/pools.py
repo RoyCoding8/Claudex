@@ -24,11 +24,15 @@ class PoolMember:
     cooldown: float | None = None
 
 
+STRATEGIES = ("fill-first", "round-robin")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelPool:
     name: str
     members: tuple[PoolMember, ...]
     enabled: bool = True
+    strategy: str = STRATEGIES[0]
 
 
 def _integer(value: Any, field: str, *, optional: bool = False, minimum: int = 1) -> int | None:
@@ -92,6 +96,11 @@ def load_pools(path: Path = POOLS_FILE, *, upstream_models: list[Model] | None =
         if name in names:
             raise RuntimeError(f"Duplicate pool name: {name}")
         names.add(name)
+        strategy = str(raw_pool.get("strategy") or STRATEGIES[0]).strip().lower()
+        if strategy not in STRATEGIES:
+            raise RuntimeError(
+                f"Pool {name!r} strategy must be one of: {', '.join(STRATEGIES)}."
+            )
         raw_members = raw_pool.get("members", [])
         if not isinstance(raw_members, list):
             raise RuntimeError(f"Pool {name!r} members must be an array.")
@@ -123,7 +132,9 @@ def load_pools(path: Path = POOLS_FILE, *, upstream_models: list[Model] | None =
             _LOG.warning("Pool %r has no members and will be ignored by the router.", name)
         elif len(members) == 1:
             _LOG.warning("Pool %r has one member; it cannot fail over.", name)
-        pools.append(ModelPool(name, tuple(members), bool(raw_pool.get("enabled", True))))
+        pools.append(ModelPool(
+            name, tuple(members), bool(raw_pool.get("enabled", True)), strategy
+        ))
     return pools
 
 
@@ -131,7 +142,9 @@ def save_pools(pools: list[ModelPool], path: Path = POOLS_FILE) -> None:
     """Atomically save while refusing to overwrite an externally edited file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "pools": [
-        {"name": pool.name, "enabled": pool.enabled, "members": [
+        {"name": pool.name, "enabled": pool.enabled,
+         **({"strategy": pool.strategy} if pool.strategy != STRATEGIES[0] else {}),
+         "members": [
             {"model": member.model,
              **({"rpm": member.rpm} if member.rpm is not None else {}),
              **({"tpm": member.tpm} if member.tpm is not None else {}),

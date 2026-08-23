@@ -138,6 +138,40 @@ class PoolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ambiguous"):
                 load_pools(path, upstream_models=upstream)
 
+    def test_strategy_round_trip(self) -> None:
+        pools = [
+            ModelPool("rr", (PoolMember("a/x"), PoolMember("b/x")), strategy="round-robin"),
+            ModelPool("ff", (PoolMember("c/x"), PoolMember("d/x"))),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pools.json"
+            save_pools(pools, path)
+            self.assertEqual(load_pools(path), pools)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["pools"][0]["strategy"], "round-robin")
+        self.assertNotIn("strategy", raw["pools"][1])
+
+    def test_rejects_unknown_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pools.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "pools": [
+                            {
+                                "name": "bad",
+                                "members": [{"model": "a/x"}, {"model": "b/x"}],
+                                "strategy": "random",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "strategy"):
+                load_pools(path)
+
     def test_conflict_with_upstream_id_raises(self) -> None:
         pools = [ModelPool("nv/glm", (PoolMember("a/x"), PoolMember("b/x")))]
         upstream = [Model("nv/glm", "nvidia")]

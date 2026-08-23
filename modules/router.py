@@ -64,6 +64,10 @@ class _Member:
 class _Pool:
     name: str
     members: tuple[_Member, ...]
+    strategy: str = "fill-first"
+
+
+_STRATEGIES = frozenset({"fill-first", "round-robin"})
 
 
 class _PoolRegistry:
@@ -151,7 +155,10 @@ def _parse_pools(payload: Any) -> dict[str, _Pool]:
                 limit, _coerce_float(item.get("cooldown"), minimum=1.0),
             ))
         if members:
-            pools[name] = _Pool(name, tuple(members))
+            strategy = str(raw.get("strategy") or "fill-first").strip().lower()
+            if strategy not in _STRATEGIES:
+                strategy = "fill-first"
+            pools[name] = _Pool(name, tuple(members), strategy)
     return pools
 
 
@@ -219,33 +226,47 @@ def _weighted_choice(members: list[_Member]) -> _Member:
     return members[-1]
 
 
+class _Rotation:
+    def __init__(self) -> None:
+        self._cursors: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def take(self, pool: str) -> int:
+        with self._lock:
+            index = self._cursors.get(pool, 0)
+            self._cursors[pool] = index + 1
+            return index
+
+
 def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
-                 limiter: _RateLimiter | None = None) -> _Member | None:
+                 limiter: _RateLimiter | None = None,
+                 rotation: _Rotation | None = None) -> _Member | None:
     """Choose one untried member without letting cooldowns suppress fallback.
 
-    Priority tiers are strict. Within a tier, ready/unpaced members are preferred,
-    followed by paced members, then cooling members. Therefore a pool only reports
-    exhaustion after every distinct member has genuinely been dispatched.
+    Availability is selected before anything else: ready/unpaced members are
+    preferred, followed by paced members, then cooling members. Within that,
+    fill-first pools drain strict priority tiers (weighted-random by rpm inside
+    a tier) while round-robin pools ignore tiers and weights, cycling through
+    members in config order. Therefore a pool only reports exhaustion after
+    every distinct member has genuinely been dispatched.
     """
     candidates = [member for member in pool.members if member.model not in exclude]
     if not candidates:
         return None
-    # Availability is selected before tiering: a ready lower-priority member is
-    # preferable to spending a request on a cooling higher-priority member.
-    # Within each availability class, priority remains strict.
-    ready = [member for member in candidates if cooldowns.is_ready(member.model)]
-    if ready:
-        selected = ready
-        if limiter is not None:
-            capacity = [m for m in ready if limiter.has_capacity(m.model, m.limit)]
-            if capacity:
-                selected = capacity
-        top = min(member.priority for member in selected)
-        return _weighted_choice([member for member in selected if member.priority == top])
-    # Every untried member is cooling. Cooldown is a last-resort preference,
-    # never a hard exclusion, so select the highest-priority candidate.
-    top = min(member.priority for member in candidates)
-    return _weighted_choice([member for member in candidates if member.priority == top])
+    selected = ready = [member for member in candidates if cooldowns.is_ready(member.model)]
+    if ready and limiter is not None:
+        capacity = [m for m in ready if limiter.has_capacity(m.model, m.limit)]
+        if capacity:
+            selected = capacity
+    if not selected:
+        # Every untried member is cooling. Cooldown is a last-resort preference,
+        # never a hard exclusion.
+        selected = candidates
+    if pool.strategy == "round-robin":
+        cursor = rotation.take(pool.name) if rotation is not None else 0
+        return selected[cursor % len(selected)]
+    top = min(member.priority for member in selected)
+    return _weighted_choice([member for member in selected if member.priority == top])
 
 
 @dataclass(slots=True)
@@ -427,13 +448,14 @@ class _RouterHandler(BaseHTTPRequestHandler):
     def _forward_pool(self, pool: _Pool, path: str, body: bytes, payload: dict[str, Any]) -> None:
         cooldowns: _CooldownTable = self.server.cooldowns  # type: ignore[attr-defined]
         limiter: _RateLimiter = self.server.limiter  # type: ignore[attr-defined]
+        rotation: _Rotation = self.server.rotation  # type: ignore[attr-defined]
         request_id = uuid.uuid4().hex[:12]
         deadline = time.monotonic() + _POOL_REQUEST_TIMEOUT
         tried: set[str] = set()
         failures: list[dict[str, Any]] = []
         attempt = 0
         while len(tried) < len(pool.members) and time.monotonic() < deadline:
-            member = _pick_member(pool, cooldowns, tried, limiter)
+            member = _pick_member(pool, cooldowns, tried, limiter, rotation)
             if member is None:
                 break
             attempt += 1
@@ -701,7 +723,8 @@ class _RouterServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int]) -> None:
         super().__init__(address, _RouterHandler)
         self.pools = _PoolRegistry(POOLS_FILE)
-        self.cooldowns, self.limiter, self.models_cache = _CooldownTable(), _RateLimiter(), _ModelListCache()
+        self.cooldowns, self.limiter = _CooldownTable(), _RateLimiter()
+        self.rotation, self.models_cache = _Rotation(), _ModelListCache()
 
 
 def _wait_upstream(deadline: float) -> None:

@@ -13,6 +13,7 @@ from prompt_toolkit.styles import Style
 
 from .models import Model
 from .pools import (
+    STRATEGIES,
     ModelPool,
     PoolMember,
     ensure_default_pools_file,
@@ -92,6 +93,20 @@ def _prompt_int(
         return number
 
 
+def _prompt_strategy(default: str = STRATEGIES[0]) -> str | None:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        try:
+            raw = input(f"  Strategy (fill-first / round-robin){suffix}: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not raw:
+            return default
+        if raw in STRATEGIES:
+            return raw
+        print("  Enter fill-first or round-robin.")
+
+
 # ── Pool list TUI ───────────────────────────────────────────────────
 
 
@@ -145,6 +160,8 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
             rpms = [m.rpm for m in pool.members if m.rpm]
             capacity_str = f"{sum(rpms):,} RPM" if rpms else "auto"
             info = f"  {len(pool.members)} models · {capacity_str}"
+            if pool.strategy != STRATEGIES[0]:
+                info += f" · {pool.strategy}"
             state = " enabled" if pool.enabled else " disabled"
 
             parts.append((icon_style if not sel else style, f"{prefix}{icon} "))
@@ -557,10 +574,13 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 _clear()
                 input("  That name already exists. Press Enter...")
                 continue
+            strategy = _prompt_strategy()
+            if strategy is None:
+                continue
             members = _edit_members_flow(name, [], upstream_models)
             if members is None:
                 continue
-            pools.append(ModelPool(name=name, members=members))
+            pools.append(ModelPool(name=name, members=members, strategy=strategy))
             save_pools(pools)
             changed = True
 
@@ -578,13 +598,17 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 _clear()
                 input("  That name already exists. Press Enter...")
                 continue
+            strategy = _prompt_strategy(pool.strategy)
+            if strategy is None:
+                continue
             members = _edit_members_flow(
                 new_name, list(pool.members), upstream_models
             )
             if members is None:
                 continue
             pools[result.index] = ModelPool(
-                name=new_name, members=members, enabled=pool.enabled
+                name=new_name, members=members, enabled=pool.enabled,
+                strategy=strategy,
             )
             save_pools(pools)
             changed = True
@@ -595,6 +619,7 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 name=pool.name,
                 members=pool.members,
                 enabled=not pool.enabled,
+                strategy=pool.strategy,
             )
             save_pools(pools)
             changed = True
