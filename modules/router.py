@@ -29,13 +29,14 @@ from .config import (
     POOLS_FILE, PROXY_API_KEY, PROXY_HOST, PROXY_PORT, ROUTER_API_KEY,
     ROUTER_COOLDOWN_429, ROUTER_COOLDOWN_5XX, ROUTER_COOLDOWN_AUTH,
     ROUTER_COOLDOWN_EMPTY, ROUTER_COOLDOWN_NETWORK, ROUTER_COOLDOWN_PACED_429,
-    ROUTER_HOST, ROUTER_LOG, ROUTER_POOL_TIMEOUT, ROUTER_PORT,
+    ROUTER_HOST, ROUTER_LOG, ROUTER_POOL_PASSES, ROUTER_POOL_TIMEOUT, ROUTER_PORT,
     ROUTER_START_TIMEOUT,
 )
 
 _UPSTREAM_TIMEOUT = 600.0
 _UPSTREAM_HEADER_TIMEOUT = 60.0
 _POOL_REQUEST_TIMEOUT = ROUTER_POOL_TIMEOUT
+_POOL_PASSES = ROUTER_POOL_PASSES
 _MODELS_CACHE_TTL = 30.0
 _POOLS_STAT_INTERVAL = 0.25
 _ERROR_PEEK_BYTES = 16 * 1024
@@ -499,7 +500,13 @@ class _RouterHandler(BaseHTTPRequestHandler):
         tried: set[str] = set()
         failures: list[dict[str, Any]] = []
         attempt = 0
-        while len(tried) < distinct and time.monotonic() < deadline:
+        sweep = 1
+        while time.monotonic() < deadline:
+            if len(tried) >= distinct:
+                if sweep >= _POOL_PASSES:
+                    break
+                sweep += 1
+                tried.clear()
             member = _pick_member(pool, cooldowns, tried, limiter, start)
             if member is None:
                 break
@@ -540,8 +547,8 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 "request=%s pool=%s member=%s status=%d category=%s cooldown=%.1fs upstream=%r",
                 request_id, pool.name, member.model, upstream.status, category, delay, prefix,
             )
-        timed_out = time.monotonic() >= deadline and len(tried) < distinct
-        _LOG.warning("request=%s pool=%s exhausted attempts=%d timed_out=%s", request_id, pool.name, len(tried), timed_out)
+        timed_out = time.monotonic() >= deadline
+        _LOG.warning("request=%s pool=%s exhausted attempts=%d sweeps=%d timed_out=%s", request_id, pool.name, attempt, sweep, timed_out)
         self._send_json(503, {"error": {
             "message": "router: no pool member succeeded", "type": "pool_exhausted",
             "request_id": request_id, "attempts": failures,

@@ -34,7 +34,9 @@ class RouterHardeningTests(unittest.TestCase):
 
     def test_all_members_cooling_still_attempts_every_member(self) -> None:
         members = [{"model": "provider/first", "priority": 1}, {"model": "provider/second", "priority": 2}]
-        with _running_router((500, {}, b"first"), (500, {}, b"second"), members=members) as router:
+        with patch("modules.router._POOL_PASSES", 1), _running_router(
+            (500, {}, b"first"), (500, {}, b"second"), members=members
+        ) as router:
             router.cooldowns.cooldown("provider/first", 30, "test")
             router.cooldowns.cooldown("provider/second", 30, "test")
             status, payload = _post(router)
@@ -45,7 +47,7 @@ class RouterHardeningTests(unittest.TestCase):
     def test_pool_larger_than_old_cap_tries_every_member(self) -> None:
         members = [{"model": f"provider/{index}", "priority": index} for index in range(10)]
         responses = [(500, {}, b"fail") for _ in members]
-        with _running_router(*responses, members=members) as router:
+        with patch("modules.router._POOL_PASSES", 1), _running_router(*responses, members=members) as router:
             status, payload = _post(router)
         self.assertEqual(status, 503)
         self.assertEqual(len(json.loads(payload)["error"]["attempts"]), 10)

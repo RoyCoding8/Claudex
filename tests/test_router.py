@@ -608,7 +608,7 @@ class PoolFailoverTests(unittest.TestCase):
     def test_all_members_failing_returns_sanitized_error(self) -> None:
         first_secret = "first-private-value"
         second_secret = "second-private-value"
-        with _running_router(
+        with patch("modules.router._POOL_PASSES", 1), _running_router(
             (401, {}, json.dumps({"error": {"message": f"API Key error {first_secret}"}}).encode()),
             (429, {}, json.dumps({"error": {"message": f"Rate limit {second_secret}"}}).encode()),
         ) as router:
@@ -636,6 +636,31 @@ class PoolFailoverTests(unittest.TestCase):
                     _UpstreamHandler.models,
                     ["provider/first", "provider/second"],
                 )
+
+    def test_second_sweep_recovers_a_member_that_failed_the_first(self) -> None:
+        with _running_router(
+            (429, {}, b'{"error":{"message":"at capacity"}}'),
+            (429, {}, b'{"error":{"message":"at capacity"}}'),
+            (200, {}, _OK_BODY),
+        ) as router:
+            status, body = _post(router)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), json.loads(_OK_BODY))
+        self.assertEqual(
+            _UpstreamHandler.models,
+            ["provider/first", "provider/second", "provider/first"],
+        )
+
+    def test_pool_gives_up_after_the_configured_number_of_sweeps(self) -> None:
+        with patch("modules.router._POOL_PASSES", 3), _running_router(
+            *[(500, {}, b"down")] * 6
+        ) as router:
+            status, body = _post(router)
+
+        self.assertEqual(status, 503)
+        self.assertEqual(len(json.loads(body)["error"]["attempts"]), 6)
+        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"] * 3)
 
     def test_round_robin_alternates_members(self) -> None:
         # Same default members (priority 1 / 2): fill-first would send every

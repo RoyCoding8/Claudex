@@ -71,6 +71,8 @@ ROUTER_COOLDOWN_PACED_429 = _env_float("CX_ROUTER_COOLDOWN_PACED_429", default=1
 ROUTER_COOLDOWN_EMPTY = _env_float("CX_ROUTER_COOLDOWN_EMPTY", default=20.0, minimum=1.0, maximum=1800.0)
 # Whole-request budget for a pooled call: every failover attempt shares it.
 ROUTER_POOL_TIMEOUT = _env_float("CX_ROUTER_POOL_TIMEOUT", default=180.0, minimum=1.0)
+# Sweeps over the member list before a pool gives up; capacity-limited providers fail transiently.
+ROUTER_POOL_PASSES = int(_env_float("CX_ROUTER_POOL_PASSES", default=2.0, minimum=1.0, maximum=10.0))
 
 DEFAULT_GPT_FAST_MODEL = _env("CX_GPT_FAST_MODEL", default="")
 DEFAULT_GPT_MEDIUM_MODEL = _env("CX_GPT_MEDIUM_MODEL", default="")
