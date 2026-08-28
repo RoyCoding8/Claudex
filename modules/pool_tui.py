@@ -97,14 +97,14 @@ def _prompt_strategy(default: str = STRATEGIES[0]) -> str | None:
     suffix = f" [{default}]" if default else ""
     while True:
         try:
-            raw = input(f"  Strategy (fill-first / round-robin){suffix}: ").strip().lower()
+            raw = input(f"  Strategy ({' / '.join(STRATEGIES)}){suffix}: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             return None
         if not raw:
             return default
         if raw in STRATEGIES:
             return raw
-        print("  Enter fill-first or round-robin.")
+        print(f"  Enter one of: {', '.join(STRATEGIES)}.")
 
 
 # ── Pool list TUI ───────────────────────────────────────────────────

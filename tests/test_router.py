@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from modules.router import (
     _CooldownTable,
+    _InFlight,
     _Member,
     _Pool,
     _PoolRegistry,
@@ -730,6 +731,145 @@ class PoolFailoverTests(unittest.TestCase):
             # provider said 2s, so it stays cooled at t+1
             with patch("modules.router.time.monotonic", return_value=time.monotonic() + 1.0):
                 self.assertFalse(router.cooldowns.is_ready("provider/first"))
+
+
+_R_CREATED = b'event: response.created\ndata: {"type":"response.created"}\n\n'
+_R_TEXT = b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+_R_ITEM = (b'event: response.output_item.added\n'
+           b'data: {"type":"response.output_item.added","item":{"type":"function_call"}}\n\n')
+_R_DONE = b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+_R_BODY = b'{"object":"response","output":[{"type":"message","content":[{"text":"ok"}]}]}'
+
+_C_TEXT = b'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}\n\n'
+_C_TOOL = (b'data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":'
+           b'[{"index":0,"function":{"name":"f"}}]}}]}\n\n')
+_C_HOLLOW = b'data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}\n\n'
+_C_DONE = b'data: [DONE]\n\n'
+_C_BODY = b'{"object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}'
+
+
+class MultiFormatPoolTests(unittest.TestCase):
+    """Pooling must judge /v1/responses and /v1/chat/completions in their own grammar."""
+
+    def _one_member(self, path: str, response, expected: bytes) -> None:
+        with _running_router((200, *response)) as router:
+            status, body = _post(router, path)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+
+    def _fails_over(self, path: str, bad, good, expected: bytes) -> None:
+        with _running_router((200, *bad), (200, *good)) as router:
+            status, body = _post(router, path)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+
+    def test_responses_content_stream_is_not_mistaken_for_empty(self) -> None:
+        stream = _R_CREATED + _R_TEXT + _R_DONE
+        self._one_member("/v1/responses", (_SSE, stream), stream)
+
+    def test_responses_tool_call_only_stream_counts_as_content(self) -> None:
+        stream = _R_CREATED + _R_ITEM + _R_DONE
+        self._one_member("/v1/responses", (_SSE, stream), stream)
+
+    def test_responses_empty_stream_tries_next_member(self) -> None:
+        good = _R_CREATED + _R_TEXT + _R_DONE
+        self._fails_over("/v1/responses", (_SSE, _R_CREATED + _R_DONE), (_SSE, good), good)
+
+    def test_responses_failed_event_tries_next_member(self) -> None:
+        failed = b'event: response.failed\ndata: {"type":"response.failed"}\n\n'
+        good = _R_CREATED + _R_TEXT + _R_DONE
+        self._fails_over("/v1/responses", (_SSE, _R_CREATED + failed), (_SSE, good), good)
+
+    def test_responses_body_without_output_tries_next_member(self) -> None:
+        self._fails_over("/v1/responses", ({}, b'{"output":[]}'), ({}, _R_BODY), _R_BODY)
+
+    def test_chat_content_stream_is_not_mistaken_for_empty(self) -> None:
+        stream = _C_TEXT + _C_DONE
+        self._one_member("/v1/chat/completions", (_SSE, stream), stream)
+
+    def test_chat_tool_call_only_stream_counts_as_content(self) -> None:
+        stream = _C_TOOL + _C_DONE
+        self._one_member("/v1/chat/completions", (_SSE, stream), stream)
+
+    def test_chat_hollow_stream_tries_next_member(self) -> None:
+        good = _C_TEXT + _C_DONE
+        self._fails_over("/v1/chat/completions", (_SSE, _C_HOLLOW + _C_DONE), (_SSE, good), good)
+
+    def test_chat_body_without_choices_tries_next_member(self) -> None:
+        self._fails_over("/v1/chat/completions", ({}, b'{"choices":[]}'), ({}, _C_BODY), _C_BODY)
+
+    def test_pooled_paths_rewrite_the_model_and_keep_the_path(self) -> None:
+        for path, response in (("/v1/responses", (_SSE, _R_CREATED + _R_TEXT + _R_DONE)),
+                               ("/v1/chat/completions", (_SSE, _C_TEXT + _C_DONE))):
+            with self.subTest(path=path):
+                with _running_router((200, *response)) as router:
+                    self.assertEqual(_post(router, path)[0], 200)
+                self.assertEqual(_UpstreamHandler.paths, [path])
+                self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+
+
+class WeightedStrategyTests(unittest.TestCase):
+    def test_ignores_priority_tiers(self) -> None:
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 9), strategy="weighted")
+        picks = {_pick_member(pool, _CooldownTable(), set()).model for _ in range(60)}
+        self.assertEqual(picks, {"a", "b"})
+
+    def test_rpm_biases_the_draw(self) -> None:
+        pool = _mk_pool(("heavy", 99, 0), ("light", 1, 0), strategy="weighted")
+        cooldowns = _CooldownTable()
+        picks = [_pick_member(pool, cooldowns, set()).model for _ in range(200)]
+        self.assertGreater(picks.count("heavy"), picks.count("light"))
+
+    def test_parsed_as_a_valid_strategy(self) -> None:
+        payload = {"pools": [{"name": "p", "members": [{"model": "a/x"}], "strategy": "weighted"}]}
+        self.assertEqual(_parse_pools(payload)["p"].strategy, "weighted")
+
+
+class LeastBusyStrategyTests(unittest.TestCase):
+    def test_prefers_the_idle_member(self) -> None:
+        pool = _mk_pool(("busy", 1, 0), ("idle", 1, 0), strategy="least-busy")
+        inflight = _InFlight()
+        with inflight.hold("busy"):
+            picks = {_pick_member(pool, _CooldownTable(), set(), inflight=inflight).model
+                     for _ in range(30)}
+        self.assertEqual(picks, {"idle"})
+
+    def test_ignores_priority_tiers_when_the_top_tier_is_loaded(self) -> None:
+        pool = _mk_pool(("top", 1, 0), ("low", 1, 9), strategy="least-busy")
+        inflight = _InFlight()
+        with inflight.hold("top"):
+            self.assertEqual(
+                _pick_member(pool, _CooldownTable(), set(), inflight=inflight).model, "low")
+
+    def test_all_idle_spreads_across_members(self) -> None:
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="least-busy")
+        inflight = _InFlight()
+        picks = {_pick_member(pool, _CooldownTable(), set(), inflight=inflight).model
+                 for _ in range(60)}
+        self.assertEqual(picks, {"a", "b"})
+
+    def test_hold_releases_the_slot(self) -> None:
+        inflight = _InFlight()
+        with inflight.hold("m"):
+            self.assertEqual(inflight.count("m"), 1)
+        self.assertEqual(inflight.count("m"), 0)
+
+    def test_hold_releases_on_exception(self) -> None:
+        inflight = _InFlight()
+        with self.assertRaises(RuntimeError), inflight.hold("m"):
+            raise RuntimeError("boom")
+        self.assertEqual(inflight.count("m"), 0)
+
+    def test_dispatch_releases_the_slot_after_the_response(self) -> None:
+        with _running_router((200, {}, _OK_BODY)) as router:
+            self.assertEqual(_post(router)[0], 200)
+            # The handler thread unwinds the hold after the client has its body.
+            deadline = time.monotonic() + 5
+            while router.inflight.count("provider/first") and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(router.inflight.count("provider/first"), 0)
 
 
 if __name__ == "__main__":

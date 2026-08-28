@@ -1,6 +1,7 @@
 """Pool configuration loading, validation, and guarded persistence."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -11,7 +12,13 @@ from .config import POOLS_EXAMPLE_FILE, POOLS_FILE
 from .models import Model
 
 _LOG = logging.getLogger("cx.pools")
-_LOADED_MTIMES: dict[Path, int] = {}
+# Content digests, not mtimes: two writes inside one filesystem clock tick
+# (~15.6 ms on Windows) share a timestamp, which would hide a lost update.
+_LOADED_DIGESTS: dict[Path, str] = {}
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +31,7 @@ class PoolMember:
     cooldown: float | None = None
 
 
-STRATEGIES = ("fill-first", "round-robin")
+STRATEGIES = ("fill-first", "round-robin", "weighted", "least-busy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,11 +74,12 @@ def _positive_float(value: Any, field: str, *, optional: bool = False) -> float 
 def load_pools(path: Path = POOLS_FILE, *, upstream_models: list[Model] | None = None) -> list[ModelPool]:
     """Load pools, accepting the same valid routing schema as the router."""
     if not path.exists():
-        _LOADED_MTIMES[path] = -1
+        _LOADED_DIGESTS[path] = ""
         return []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        _LOADED_MTIMES[path] = path.stat().st_mtime_ns
+        text = path.read_text(encoding="utf-8")
+        payload = json.loads(text)
+        _LOADED_DIGESTS[path] = _digest(text)
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read pool configuration:\n{path}\n{error}") from error
     raw_pools = payload.get("pools", []) if isinstance(payload, dict) else []
@@ -155,15 +163,16 @@ def save_pools(pools: list[ModelPool], path: Path = POOLS_FILE) -> None:
         ]}
         for pool in pools
     ]}
+    body = json.dumps(payload, indent=2) + "\n"
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    expected = _LOADED_MTIMES.get(path)
-    actual = path.stat().st_mtime_ns if path.exists() else -1
+    temporary.write_text(body, encoding="utf-8")
+    expected = _LOADED_DIGESTS.get(path)
+    actual = _digest(path.read_text(encoding="utf-8")) if path.exists() else ""
     if expected is not None and actual != expected:
         temporary.unlink(missing_ok=True)
         raise RuntimeError("Pool configuration changed on disk; reload before saving so no edits are lost.")
     temporary.replace(path)
-    _LOADED_MTIMES[path] = path.stat().st_mtime_ns
+    _LOADED_DIGESTS[path] = _digest(body)
 
 
 def pool_names(pools: list[ModelPool] | None = None) -> set[str]:

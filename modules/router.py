@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -22,7 +23,7 @@ from itertools import chain
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlsplit
 
 from .config import (
@@ -48,7 +49,8 @@ _COOLDOWN_ON_AUTH = ROUTER_COOLDOWN_AUTH
 _COOLDOWN_ON_PACED_429 = ROUTER_COOLDOWN_PACED_429
 _COOLDOWN_ON_EMPTY = ROUTER_COOLDOWN_EMPTY
 _AUTH_STATUS = frozenset({401, 403})
-_CONTENT_EVENTS = frozenset({"content_block_start", "content_block_delta"})
+_POOLED_PATHS = frozenset({"/v1/messages", "/v1/messages/count_tokens",
+                           "/v1/responses", "/v1/chat/completions"})
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
@@ -72,7 +74,28 @@ class _Pool:
     strategy: str = "fill-first"
 
 
-_STRATEGIES = frozenset({"fill-first", "round-robin"})
+class _InFlight:
+    """Live dispatch count per member, the ordering key for least-busy pools."""
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def count(self, model: str) -> int:
+        with self._lock:
+            return self._counts.get(model, 0)
+
+    @contextmanager
+    def hold(self, model: str) -> Iterator[None]:
+        with self._lock:
+            self._counts[model] = self._counts.get(model, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                if (remaining := self._counts.get(model, 1) - 1) > 0:
+                    self._counts[model] = remaining
+                else:
+                    self._counts.pop(model, None)
 
 
 class _PoolRegistry:
@@ -254,17 +277,39 @@ class _Rotation:
                 self._state[pool] = (size, (index + 1) % size)
 
 
+def _top_tier(members: list[_Member]) -> list[_Member]:
+    top = min(member.priority for member in members)
+    return [member for member in members if member.priority == top]
+
+
+def _idlest(members: list[_Member], inflight: _InFlight | None) -> list[_Member]:
+    counts = {m.model: inflight.count(m.model) if inflight else 0 for m in members}
+    least = min(counts.values())
+    return [member for member in members if counts[member.model] == least]
+
+
+_SELECTORS: dict[str, Callable[[list[_Member], _InFlight | None], _Member]] = {
+    "fill-first": lambda selected, inflight: _weighted_choice(_top_tier(selected)),
+    "weighted": lambda selected, inflight: _weighted_choice(selected),
+    "least-busy": lambda selected, inflight: _weighted_choice(_idlest(selected, inflight)),
+}
+_STRATEGIES = frozenset({"round-robin", *_SELECTORS})
+
+
 def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
                  limiter: _RateLimiter | None = None,
-                 start: int | None = None) -> _Member | None:
+                 start: int | None = None,
+                 inflight: _InFlight | None = None) -> _Member | None:
     """Choose one untried member without letting cooldowns suppress fallback.
 
     Availability is selected before anything else: ready/unpaced members are
     preferred, followed by paced members, then cooling members. Within that,
     fill-first pools drain strict priority tiers (weighted-random by rpm inside
-    a tier) while round-robin pools ignore tiers and weights, scanning from the
-    rotation cursor in config order. Therefore a pool only reports exhaustion
-    after every distinct member has genuinely been dispatched.
+    a tier), weighted pools draw by rpm across every tier, least-busy pools draw
+    among the members holding the fewest live dispatches, and round-robin pools
+    ignore tiers and weights, scanning from the rotation cursor in config order.
+    Therefore a pool only reports exhaustion after every distinct member has
+    genuinely been dispatched.
     """
     if pool.strategy == "round-robin":
         return _rotate_member(pool, cooldowns, exclude, limiter, start or 0)
@@ -280,8 +325,7 @@ def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
         # Every untried member is cooling. Cooldown is a last-resort preference,
         # never a hard exclusion.
         selected = candidates
-    top = min(member.priority for member in selected)
-    return _weighted_choice([member for member in selected if member.priority == top])
+    return _SELECTORS.get(pool.strategy, _SELECTORS["fill-first"])(selected, inflight)
 
 
 def _rotate_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
@@ -431,13 +475,10 @@ class _RouterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        if path == "/v1/messages":
+        if path in _POOLED_PATHS:
             if self._require_auth():
-                self._handle_messages(count_tokens=False)
-        elif path == "/v1/messages/count_tokens":
-            if self._require_auth():
-                self._handle_messages(count_tokens=True)
-        elif path in {"/v1/chat/completions", "/v1/completions"}:
+                self._handle_pooled(path)
+        elif path == "/v1/completions":
             if self._require_auth():
                 self._handle_passthrough(path)
         else:
@@ -464,7 +505,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
         payload["object"], payload["data"] = "list", data
         self._send_json(200, payload)
 
-    def _handle_messages(self, *, count_tokens: bool) -> None:
+    def _handle_pooled(self, path: str) -> None:
         body = self._read_body()
         if body is None:
             return
@@ -481,17 +522,17 @@ class _RouterHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "missing 'model' field"}})
             return
         registry: _PoolRegistry = self.server.pools  # type: ignore[attr-defined]
-        upstream_path = "/v1/messages/count_tokens" if count_tokens else "/v1/messages"
         pool = registry.get(requested_model)
         if pool is None:
-            self._forward_once(upstream_path, dict(self.headers), body)
+            self._forward_once(path, dict(self.headers), body)
         else:
-            self._forward_pool(pool, upstream_path, body, payload)
+            self._forward_pool(pool, path, body, payload)
 
     def _forward_pool(self, pool: _Pool, path: str, body: bytes, payload: dict[str, Any]) -> None:
         cooldowns: _CooldownTable = self.server.cooldowns  # type: ignore[attr-defined]
         limiter: _RateLimiter = self.server.limiter  # type: ignore[attr-defined]
         rotation: _Rotation = self.server.rotation  # type: ignore[attr-defined]
+        inflight: _InFlight = self.server.inflight  # type: ignore[attr-defined]
         request_id = uuid.uuid4().hex[:12]
         deadline = time.monotonic() + _POOL_REQUEST_TIMEOUT
         size = len(pool.members)
@@ -507,7 +548,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
                     break
                 sweep += 1
                 tried.clear()
-            member = _pick_member(pool, cooldowns, tried, limiter, start)
+            member = _pick_member(pool, cooldowns, tried, limiter, start, inflight)
             if member is None:
                 break
             attempt += 1
@@ -517,36 +558,37 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 index for index, m in enumerate(pool.members) if m.model == member.model))
             rewritten = _rewrite_model(body, payload, member.model)
             _LOG.info("request=%s attempt=%d pool=%s member=%s", request_id, attempt, pool.name, member.model)
-            try:
-                upstream = _forward_to_upstream(
-                    "POST", path, _upstream_headers(self.headers, rewritten), rewritten, deadline)
-                retry = _classify_retry(upstream, path=path, deadline=deadline)
-            except (OSError, HTTPException) as error:
-                cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "network")
-                failures.append({"category": "network"})
-                _LOG.warning("request=%s pool=%s member=%s category=network error=%s", request_id, pool.name, member.model, error)
-                continue
-            if retry is None:
-                if self._stream_upstream(upstream, request_id=request_id, member=member.model):
-                    cooldowns.clear(member.model)
-                else:
-                    cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "stream_drop")
-                return
-            category, delay = retry
-            if category == "rate_limit":
-                _log_rate_limit_headers(member.model, upstream.headers)
-                if not _has_retry_after(upstream.headers):
-                    delay = member.cooldown if member.cooldown is not None else (
-                        _COOLDOWN_ON_PACED_429 if member.limit is not None else delay
-                    )
-            prefix = _read_error_prefix(upstream)
-            upstream.close()
-            cooldowns.cooldown(member.model, delay, category)
-            failures.append({"category": category, "status": upstream.status})
-            _LOG.warning(
-                "request=%s pool=%s member=%s status=%d category=%s cooldown=%.1fs upstream=%r",
-                request_id, pool.name, member.model, upstream.status, category, delay, prefix,
-            )
+            with inflight.hold(member.model):
+                try:
+                    upstream = _forward_to_upstream(
+                        "POST", path, _upstream_headers(self.headers, rewritten), rewritten, deadline)
+                    retry = _classify_retry(upstream, path=path, deadline=deadline)
+                except (OSError, HTTPException) as error:
+                    cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "network")
+                    failures.append({"category": "network"})
+                    _LOG.warning("request=%s pool=%s member=%s category=network error=%s", request_id, pool.name, member.model, error)
+                    continue
+                if retry is None:
+                    if self._stream_upstream(upstream, request_id=request_id, member=member.model):
+                        cooldowns.clear(member.model)
+                    else:
+                        cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "stream_drop")
+                    return
+                category, delay = retry
+                if category == "rate_limit":
+                    _log_rate_limit_headers(member.model, upstream.headers)
+                    if not _has_retry_after(upstream.headers):
+                        delay = member.cooldown if member.cooldown is not None else (
+                            _COOLDOWN_ON_PACED_429 if member.limit is not None else delay
+                        )
+                prefix = _read_error_prefix(upstream)
+                upstream.close()
+                cooldowns.cooldown(member.model, delay, category)
+                failures.append({"category": category, "status": upstream.status})
+                _LOG.warning(
+                    "request=%s pool=%s member=%s status=%d category=%s cooldown=%.1fs upstream=%r",
+                    request_id, pool.name, member.model, upstream.status, category, delay, prefix,
+                )
         timed_out = time.monotonic() >= deadline
         _LOG.warning("request=%s pool=%s exhausted attempts=%d sweeps=%d timed_out=%s", request_id, pool.name, attempt, sweep, timed_out)
         self._send_json(503, {"error": {
@@ -708,7 +750,7 @@ def _retry_after_seconds(headers: list[tuple[str, str]], default: float) -> floa
     return default
 
 
-def _sse_event(frame: bytes) -> str:
+def _sse_parts(frame: bytes) -> tuple[str, Any]:
     """Name one SSE envelope by its `event:` line, falling back to `data.type`."""
     event, data_lines = "", []
     for line in frame.decode("utf-8", errors="replace").replace("\r\n", "\n").split("\n"):
@@ -716,26 +758,82 @@ def _sse_event(frame: bytes) -> str:
             event = line[6:].strip()
         elif line.startswith("data:"):
             data_lines.append(line[5:].lstrip())
-    if event:
-        return event
+    raw = "\n".join(data_lines).strip()
     try:
-        payload = json.loads("\n".join(data_lines)) if data_lines else None
+        payload = json.loads(raw) if raw and raw != "[DONE]" else None
     except json.JSONDecodeError:
-        return ""
-    return str(payload.get("type") or "") if isinstance(payload, dict) else ""
+        payload = None
+    if not event and isinstance(payload, dict):
+        event = str(payload.get("type") or "")
+    return event, payload
+
+
+def _sse_event(frame: bytes) -> str:
+    return _sse_parts(frame)[0]
 
 
 def _sse_frame_is_error(frame: bytes) -> bool:
-    return _sse_event(frame) == "error"
+    return _sse_event(frame) in _ERROR_EVENTS
 
 
-_HEAD_VERDICTS = {
-    "error": ("stream_error", _COOLDOWN_ON_5XX),
-    "message_stop": ("empty", _COOLDOWN_ON_EMPTY),
+def _chat_delta_has_content(payload: Any) -> bool:
+    """Chat frames carry no `event:` line, so content is judged from the delta itself."""
+    if not isinstance(payload, dict):
+        return False
+    choice = next(iter(payload.get("choices") or ()), None)
+    delta = (choice or {}).get("delta") or {}
+    return any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls"))
+
+
+@dataclass(frozen=True)
+class _Grammar:
+    content_events: frozenset[str]
+    verdicts: dict[str, tuple[str, float]]
+    body_field: str
+    payload_probe: Callable[[Any], bool] | None = None
+
+    def has_content(self, event: str, payload: Any) -> bool:
+        return event in self.content_events or bool(
+            self.payload_probe and self.payload_probe(payload))
+
+
+_STREAM_ERROR = ("stream_error", _COOLDOWN_ON_5XX)
+_EMPTY = ("empty", _COOLDOWN_ON_EMPTY)
+
+_ANTHROPIC_GRAMMAR = _Grammar(
+    frozenset({"content_block_start", "content_block_delta"}),
+    {"error": _STREAM_ERROR, "message_stop": _EMPTY},
+    "content",
+)
+_RESPONSES_GRAMMAR = _Grammar(
+    frozenset({"response.output_item.added", "response.output_text.delta",
+               "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+               "response.function_call_arguments.delta"}),
+    {"error": _STREAM_ERROR, "response.failed": _STREAM_ERROR,
+     "response.incomplete": _EMPTY, "response.completed": _EMPTY},
+    "output",
+)
+_CHAT_GRAMMAR = _Grammar(
+    frozenset(),
+    {"error": _STREAM_ERROR},
+    "choices",
+    _chat_delta_has_content,
+)
+
+_GRAMMARS = {
+    "/v1/messages": _ANTHROPIC_GRAMMAR,
+    "/v1/responses": _RESPONSES_GRAMMAR,
+    "/v1/chat/completions": _CHAT_GRAMMAR,
 }
+_ERROR_EVENTS = frozenset({"error", "response.failed"})
 
 
-def _validate_stream_head(upstream: _UpstreamResponse, deadline: float) -> tuple[str, float] | None:
+def _grammar_for(path: str) -> _Grammar:
+    return _GRAMMARS.get(path.removesuffix("/count_tokens"), _ANTHROPIC_GRAMMAR)
+
+
+def _validate_stream_head(upstream: _UpstreamResponse, deadline: float,
+                          grammar: _Grammar) -> tuple[str, float] | None:
     """Hold an SSE response until it proves it carries content.
 
     Every byte read here is re-chained onto ``body_iter``, so committing costs
@@ -753,12 +851,13 @@ def _validate_stream_head(upstream: _UpstreamResponse, deadline: float) -> tuple
             events = []
             while b"\n\n" in buffered:
                 frame, buffered = buffered.split(b"\n\n", 1)
-                events.append(_sse_event(frame))
+                events.append(_sse_parts(frame))
             # Content anywhere in this batch wins: a later error frame is then
             # post-commit, forwarded and flagged by the streaming loop instead.
-            if any(event in _CONTENT_EVENTS for event in events):
+            if any(grammar.has_content(event, payload) for event, payload in events):
                 break
-            if outcome := next((_HEAD_VERDICTS[e] for e in events if e in _HEAD_VERDICTS), None):
+            if outcome := next((grammar.verdicts[e] for e, _ in events
+                                if e in grammar.verdicts), None):
                 break
     except StopIteration:
         outcome = "empty", _COOLDOWN_ON_EMPTY
@@ -768,7 +867,8 @@ def _validate_stream_head(upstream: _UpstreamResponse, deadline: float) -> tuple
     return outcome
 
 
-def _validate_body(upstream: _UpstreamResponse, path: str) -> tuple[str, float] | None:
+def _validate_body(upstream: _UpstreamResponse, path: str,
+                   grammar: _Grammar) -> tuple[str, float] | None:
     """Judge a non-SSE 2xx while failover is still possible."""
     upstream.relax_timeout()
     try:
@@ -787,7 +887,7 @@ def _validate_body(upstream: _UpstreamResponse, path: str) -> tuple[str, float] 
     # count_tokens answers with {"input_tokens": N} and never carries content.
     if path.endswith("/count_tokens"):
         return None
-    content = payload.get("content")
+    content = payload.get(grammar.body_field)
     if not isinstance(content, list) or not content:
         return "empty", _COOLDOWN_ON_EMPTY
     return None
@@ -795,9 +895,10 @@ def _validate_body(upstream: _UpstreamResponse, path: str) -> tuple[str, float] 
 
 def _classify_retry(upstream: _UpstreamResponse, *, path: str, deadline: float) -> tuple[str, float] | None:
     if 200 <= upstream.status < 300:
+        grammar = _grammar_for(path)
         if _is_event_stream(upstream.headers):
-            return _validate_stream_head(upstream, deadline)
-        return _validate_body(upstream, path)
+            return _validate_stream_head(upstream, deadline, grammar)
+        return _validate_body(upstream, path, grammar)
     if upstream.status == 429:
         return "rate_limit", _retry_after_seconds(upstream.headers, _COOLDOWN_ON_429_DEFAULT)
     if upstream.status in _AUTH_STATUS:
@@ -834,6 +935,7 @@ class _RouterServer(ThreadingHTTPServer):
         self.pools = _PoolRegistry(POOLS_FILE)
         self.cooldowns, self.limiter = _CooldownTable(), _RateLimiter()
         self.rotation, self.models_cache = _Rotation(), _ModelListCache()
+        self.inflight = _InFlight()
 
 
 def _wait_upstream(deadline: float) -> None:

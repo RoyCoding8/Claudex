@@ -1,5 +1,7 @@
 # Claudex
 
+[![tests](https://github.com/RoyCoding8/Claudex/actions/workflows/tests.yml/badge.svg)](https://github.com/RoyCoding8/Claudex/actions/workflows/tests.yml)
+
 Claudex is a small TUI launcher for [Claude Code](https://docs.claude.com/en/docs/claude-code) that
 routes Claude Code through a local two-layer proxy so you can point one Claude Code install at any
 provider you have credentials for, and pool several providers together behind a single model name.
@@ -10,10 +12,11 @@ Claude Code → cx router :4000 → CLIProxyAPI :8317 → providers
 
 - **CLIProxyAPI** owns provider accounts, API keys, per-provider prefixes, and model discovery.
 - **cx router** (this repo) sits in front of CLIProxyAPI and adds cross-provider *pools*, weighted
-  routing, retries, and cooldowns. It speaks Claude Code's Anthropic `/v1/messages` protocol and
+  routing, retries, and cooldowns. It pools all three wire formats CLIProxyAPI serves — Anthropic
+  `/v1/messages`, OpenAI `/v1/responses` (what Codex speaks), and `/v1/chat/completions` — and
   passes everything else through unchanged.
 
-The router is a single-file, stdlib-only Python service (~870 lines). The launcher adds two small
+The router is a single-file, stdlib-only Python service (~980 lines). The launcher adds two small
 runtime dependencies: `prompt-toolkit` for the TUI and `python-dotenv` for optional `.env` loading.
 It boots in ~250ms and requires no build step.
 
@@ -49,7 +52,7 @@ Press **F7** in the model picker to create cross-provider pools:
 2. Add ≥ 2 provider-specific model IDs (`nvidia_nim/z-ai/glm-5.2`, `vercel/zai/glm-5.2`, …).
 3. Set the real RPM/TPM limit per member. If unsure, leave blank (auto).
 4. Optionally set a priority per member (lower number = tried first).
-5. Pick a routing strategy: `fill-first` (default) or `round-robin`.
+5. Pick a routing strategy: `fill-first` (default), `round-robin`, `weighted`, or `least-busy`.
 6. Save and return to the picker.
 
 Pool definitions live in `data/pools.json`. The router reloads them automatically on every request
@@ -73,20 +76,65 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 ## Router semantics
 
-- **Selection**. Strict priority tiers are preserved within each availability class: ready/unpaced members are preferred first, then paced-out members, then cooling members. Within the selected class, the router only considers members at the lowest priority number and picks weighted-random by `rpm`. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. A pool with `"strategy": "round-robin"` instead cycles through its members evenly in config order — priority tiers and `rpm` weights are ignored, while the availability preferences above still apply. The rotation cursor tracks member *identity* and advances once per request, parking just past whichever member was actually dispatched: a member that served a retry is not handed the next request as well, and a member skipped while cooling reclaims its own slot once it recovers.
+- **Selection**. Availability is filtered first, in every strategy: ready/unpaced members are preferred, then paced-out members, then cooling members. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. Within the surviving candidates the strategy decides:
+  - `fill-first` (default) — only members at the lowest priority number are considered, chosen weighted-random by `rpm`. Drains a tier before touching the next.
+  - `round-robin` — cycles evenly through the members in config order; priority tiers and `rpm` weights are ignored. The rotation cursor tracks member *identity* and advances once per request, parking just past whichever member was actually dispatched: a member that served a retry is not handed the next request as well, and a member skipped while cooling reclaims its own slot once it recovers.
+  - `weighted` — draws weighted-random by `rpm` across *every* tier at once, so a low-priority member still gets its share of traffic.
+  - `least-busy` — picks among the members holding the fewest live in-flight dispatches, breaking ties weighted-random by `rpm`. Best when members differ in latency rather than quota.
 - **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member is deprioritized so another candidate can serve the request instead of burning a `429`. The sliding window ages out on its own, so the member becomes preferred again when its oldest request falls out of it.
 - **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or SSE `error` **frame envelope** seen before the commit point cools that backend and tries the next member. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It sweeps every pool member in priority order, and by default sweeps the list twice (`CX_ROUTER_POOL_PASSES`) before giving up — capacity-limited providers reject transiently, so a member that failed one sweep often succeeds on the next. Sweeps stop early at the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`); each attempt's upstream wait is clamped to what remains of that budget.
-- **Empty responses**. A `200` carrying no usable content is a failure, not an answer: zero bytes, no complete SSE frame, an unparseable body, `{}`, `{"content": []}`, or a stream that reaches `message_stop` without a single content block. Any of these cools the member (20 s, `CX_ROUTER_COOLDOWN_EMPTY`) and fails over, so a flaky provider returning empties can no longer stall Claude Code. `count_tokens` is exempt from the content check — its success body legitimately has none.
+- **Empty responses**. A `200` carrying no usable content is a failure, not an answer: zero bytes, no complete SSE frame, an unparseable body, `{}`, an empty content array, or a stream that reaches its terminal event without a single content frame. Any of these cools the member (20 s, `CX_ROUTER_COOLDOWN_EMPTY`) and fails over, so a flaky provider returning empties can no longer stall the client. Each format is judged in its own vocabulary (see **Wire formats** below); a tool-call-only turn counts as content in all three. `count_tokens` is exempt from the content check — its success body legitimately has none.
 - **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.
-- **Streaming**. The router holds an SSE response until it proves it carries content — the first `content_block_start`/`content_block_delta` — then replays the buffered head and streams the rest incrementally via `HTTPResponse.read1()`. Committing therefore costs only the provider's real time-to-first-token, and the client still receives the stream from its very first frame. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event, logged, and cools the member so the next request avoids it. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
+- **Streaming**. The router holds an SSE response until it proves it carries content — the first content frame in that format's vocabulary — then replays the buffered head and streams the rest incrementally via `HTTPResponse.read1()`. Committing therefore costs only the provider's real time-to-first-token, and the client still receives the stream from its very first frame. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event, logged, and cools the member so the next request avoids it. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
 - **Passthrough**. If the incoming `model` field is not one of your enabled pool names, the request is forwarded unchanged. Pooled `count_tokens` requests use the same failover policy.
 - **Errors**. Non-pooled requests preserve upstream responses unchanged. A pool returns a sanitized `503` only after every member was attempted or the request deadline expired. The response includes a correlation `request_id`; upstream error bodies are logged locally (bounded) and are never returned to Claude Code.
 
 ## Endpoints
 
-The router speaks Anthropic on `/v1/messages`, passes through `/v1/chat/completions` and
-`/v1/completions` for OpenAI-native clients, exposes `/v1/models` (CLIProxyAPI's list + your
-pool aliases), and answers `/health`, `/-/ready`, `/-/health`, `/` for probes.
+Pooled — pool names are accepted as the `model`, with failover, cooldown, and pacing:
+`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/chat/completions`.
+
+Passthrough: `/v1/completions`. Plus `/v1/models` (CLIProxyAPI's list + your pool aliases) and
+`/health`, `/-/ready`, `/-/health`, `/` for probes.
+
+The pool applies to whichever format the client sent; the router never translates between them —
+CLIProxyAPI already serves all three, so a pool member is a *model name*, valid on any of them.
+
+## Wire formats
+
+Failover depends on telling "the model said nothing" apart from "the model is still talking", and
+each format spells that differently. The router keeps one grammar per format:
+
+| | `/v1/messages` | `/v1/responses` | `/v1/chat/completions` |
+|---|---|---|---|
+| Client | Claude Code | Codex | OpenAI-native |
+| Content frames | `content_block_start`, `content_block_delta` | `response.output_item.added`, `response.output_text.delta`, `.reasoning_text.delta`, `.reasoning_summary_text.delta`, `.function_call_arguments.delta` | any `delta` with `content`, `reasoning_content`, or `tool_calls` |
+| Fail → retry | `event: error` | `event: error`, `response.failed` | `event: error` |
+| Terminal with no content → retry | `message_stop` | `response.completed`, `response.incomplete` | end of stream |
+| Non-stream body must hold | `content[]` | `output[]` | `choices[]` |
+
+Chat frames carry no `event:` line, so their verdict comes from the delta payload rather than an
+event name. Names are read only from the SSE envelope, never from assistant text, so a model may
+safely discuss `event: error` without triggering a failover.
+
+## Pointing Codex at a pool
+
+`wire_api = "responses"` is the only value Codex supports, which is why `/v1/responses` is pooled.
+In `~/.codex/config.toml`:
+
+```toml
+model = "Opus-level"
+model_provider = "cx"
+
+[model_providers.cx]
+name = "cx-router"
+base_url = "http://127.0.0.1:4000/v1"
+env_key = "CX_ROUTER_API_KEY"
+wire_api = "responses"
+```
+
+`model` is a pool name from `data/pools.json`; set `CX_ROUTER_API_KEY` in the environment to the
+router key.
 
 ## Ports and keys
 
@@ -131,7 +179,7 @@ cx.bat                      # Windows launcher (uv sync + cx.py)
 .env.example                # env var template (tracked); copy to .env (ignored)
 modules/
   proxy.py                  # CLIProxyAPI lifecycle
-  router.py                 # the pool router (Anthropic /v1/messages + passthrough)
+  router.py                 # the pool router (messages / responses / chat + passthrough)
   router_starter.py         # router lifecycle (health check + subprocess spawn)
   pools.py                  # pools.json schema + load/save + validation
   models.py                 # /v1/models fetch, dedup, categorization
@@ -147,9 +195,11 @@ data/
   router.log                # router runtime log (ignored)
   router.pid                # router pid (ignored)
 tests/
-  test_router.py            # pool selection, forwarding, failover, streaming
+  test_router.py            # pool selection, strategies, forwarding, failover, streaming
+  test_router_hardening.py  # deadlines, sweeps, empty/truncated bodies, error sanitizing
   test_tui.py               # picker exit safety + model parameter editing
   test_pools.py             # pools.json schema + validation
+  test_pool_hardening.py    # pools.json edge cases + atomic save
   test_models.py            # /v1/models fetch + dedup
   test_launcher.py          # Claude Code env setup
 ```
@@ -159,6 +209,11 @@ tests/
 ```bat
 uv run --project . python -m unittest discover tests
 ```
+
+CI runs the same command on `windows-latest` against Python 3.11, 3.12, and 3.13
+(`.github/workflows/tests.yml`) for every push to `main` and every pull request. The suite is
+hermetic — it stands up loopback servers on ephemeral ports and never touches CLIProxyAPI or a
+provider.
 
 ## Multi-session support
 
