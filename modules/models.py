@@ -1,22 +1,11 @@
-"""Model discovery and categorisation.
-
-Models come from CLIProxyAPI (``/v1/models``); pool names come from the local
-``pools.json`` and are merged in as synthetic entries with ``owner='pool'``.
-
-Two fetch functions exist so callers can choose their upstream:
-
-    * ``fetch_upstream_models`` — hits CLIProxyAPI directly. Used by the pool
-      UI, the router (indirectly), and pool validation.
-    * ``fetch_models``           — hits the cx router. Used by the model
-      picker after the router is up, so users see the exact set the router
-      would honour (upstream models + our pool aliases).
-"""
+"""Model discovery and categorisation."""
 
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -38,6 +27,8 @@ class Model:
 
 
 CATEGORIES = ("All", "Pools", "Codex", "Grok", "Kimi", "Custom")
+
+_MAX_MODELS_BYTES = 32 * 1024 * 1024
 
 
 def _models_url(host: str, port: int) -> str:
@@ -63,7 +54,7 @@ def fetch_models_from(
 
     try:
         with urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
+            payload = json.loads(response.read(_MAX_MODELS_BYTES))
     except HTTPError as error:
         if error.code == 401:
             raise RuntimeError(
@@ -73,7 +64,7 @@ def fetch_models_from(
         raise RuntimeError(f"{service_name} returned HTTP {error.code}.") from error
     except (URLError, TimeoutError) as error:
         raise RuntimeError(f"{service_name} is not responding.") from error
-    except (json.JSONDecodeError, TypeError) as error:
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, HTTPException, OSError) as error:
         raise RuntimeError(f"{service_name} returned an invalid model response.") from error
 
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
@@ -102,15 +93,7 @@ def fetch_models_from(
 def _dedup_bare_aliases(models: list[Model]) -> list[Model]:
     """Drop bare aliases when a prefixed form with the same tail exists.
 
-    CLIProxyAPI often exposes the same underlying model twice — once under its
-    provider prefix (e.g. ``vercel/openai/gpt-5.4``) and once as a bare alias
-    (``gpt-5.4``). The bare form is ambiguous when several providers offer the
-    same tail name, and pool members always reference the prefixed form, so
-    the picker becomes clearer if we hide the bare aliases whenever a
-    prefixed form is available.
-
-    Pool aliases (``is_pool``) are always kept — they have no upstream prefix
-    and are the router's own routable names.
+    Pool aliases are always kept — they have no upstream prefix.
     """
     tails_with_prefix = {
         model.id.rsplit("/", 1)[-1]
@@ -159,15 +142,11 @@ def category_for(model: Model) -> str:
     model_id = model.id.lower()
     owner_tokens = set(filter(None, re.split(r"[^a-z0-9]+", owner)))
 
-    if owner in {"openai", "codex"} or {"openai", "codex"} & owner_tokens:
-        return "Codex"
-    if owner in {"xai", "x-ai", "grok"} or {"xai", "grok"} & owner_tokens:
-        return "Grok"
-    if owner in {"kimi", "moonshot"} or {"kimi", "moonshot"} & owner_tokens:
-        return "Kimi"
+    for category, names in (("Codex", {"openai", "codex"}), ("Grok", {"xai", "x-ai", "grok"}),
+                            ("Kimi", {"kimi", "moonshot"})):
+        if owner in names or names & owner_tokens:
+            return category
 
-    # Fallback: aggregator owners (SiliconFlow, OpenRouter, NIM) hide the real
-    # origin, so guess from the model id too.
     if model_id.startswith("gpt-"):
         return "Codex"
     if model_id.startswith("grok-"):
@@ -180,15 +159,10 @@ def category_for(model: Model) -> str:
 
 def filter_models(models: list[Model], category: str, query: str) -> list[Model]:
     tokens = [token for token in query.lower().split() if token]
-    result: list[Model] = []
-
-    for model in models:
-        model_category = category_for(model)
-        if category != "All" and model_category != category:
-            continue
-
-        haystack = f"{model.id} {model.owner} {model_category}".lower()
-        if all(token in haystack for token in tokens):
-            result.append(model)
-
-    return result
+    return [
+        model for model in models
+        if (model_category := category_for(model))
+        and (category == "All" or model_category == category)
+        and (haystack := f"{model.id} {model.owner} {model_category}".lower())
+        and all(token in haystack for token in tokens)
+    ]

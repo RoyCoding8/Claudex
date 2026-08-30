@@ -35,8 +35,6 @@ class ModelFetchTests(unittest.TestCase):
 
     @patch("modules.models.urlopen")
     def test_owner_pool_from_upstream_becomes_pool(self, urlopen) -> None:
-        # The router advertises pool aliases with owned_by='pool'; fetch_models
-        # should treat that as authoritative even without a pool_names hint.
         payload = {"data": [{"id": "glm-pool", "owned_by": "pool"}]}
         urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
         models = fetch_models_from("127.0.0.1", 4000, "key", "cx router")
@@ -51,8 +49,6 @@ class ModelFetchTests(unittest.TestCase):
 
     @patch("modules.models.urlopen")
     def test_dedup_drops_bare_alias_when_prefixed_exists(self, urlopen) -> None:
-        # CLIProxyAPI often serves the same model twice — once bare, once
-        # prefixed. The bare form should be hidden.
         payload = {
             "data": [
                 {"id": "gpt-5.4", "owned_by": "openai"},
@@ -75,8 +71,6 @@ class ModelFetchTests(unittest.TestCase):
 
     @patch("modules.models.urlopen")
     def test_dedup_never_hides_pool_aliases(self, urlopen) -> None:
-        # Even if some upstream model happens to share a name with the pool,
-        # the pool alias must survive.
         payload = {
             "data": [
                 {"id": "glm-pool", "owned_by": "pool"},
@@ -87,6 +81,28 @@ class ModelFetchTests(unittest.TestCase):
         models = fetch_models_from("127.0.0.1", 4000, "k", "cx router")
         pool = next(m for m in models if m.id == "glm-pool")
         self.assertTrue(pool.is_pool)
+
+
+    @patch("modules.models.urlopen")
+    def test_non_utf8_body_raises_runtime_error(self, urlopen) -> None:
+        urlopen.return_value = io.BytesIO(b'\xff\xfe{"data":[]}')
+        with self.assertRaisesRegex(RuntimeError, "invalid model response"):
+            fetch_models_from("127.0.0.1", 4000, "key", "test router")
+
+    @patch("modules.models.urlopen")
+    def test_truncated_body_raises_runtime_error(self, urlopen) -> None:
+        from http.client import IncompleteRead
+        response = urlopen.return_value
+        response.read.side_effect = IncompleteRead(b"partial")
+        with self.assertRaisesRegex(RuntimeError, "invalid model response"):
+            fetch_models_from("127.0.0.1", 4000, "key", "test router")
+
+    @patch("modules.models.urlopen")
+    def test_url_error_raises_not_responding(self, urlopen) -> None:
+        from urllib.error import URLError
+        urlopen.side_effect = URLError("connection refused")
+        with self.assertRaisesRegex(RuntimeError, "not responding"):
+            fetch_models_from("127.0.0.1", 4000, "key", "test router")
 
 
 if __name__ == "__main__":

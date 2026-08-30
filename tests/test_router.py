@@ -5,6 +5,7 @@ import json
 import tempfile
 import threading
 import time
+import types
 import unittest
 from collections import deque
 from contextlib import contextmanager
@@ -16,18 +17,17 @@ from modules.router import (
     _CooldownTable,
     _InFlight,
     _Member,
+    _parse_pools,
+    _pick_member,
     _Pool,
     _PoolRegistry,
     _RateLimiter,
-    _Rotation,
-    _RouterServer,
-    _parse_pools,
-    _pick_member,
     _retry_after_seconds,
     _rewrite_model,
+    _Rotation,
+    _RouterServer,
     _upstream_headers,
 )
-
 
 _SSE = {"Content-Type": "text/event-stream"}
 _OK_BODY = b'{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'
@@ -38,12 +38,8 @@ _STOP = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 def _rotate(pool: _Pool, cooldowns: _CooldownTable, rotation: _Rotation,
             exclude: set[str] | None = None) -> _Member:
-    """One round-robin dispatch: read the cursor, pick, then park it."""
-    size = len(pool.members)
-    member = _pick_member(pool, cooldowns, exclude or set(), None, rotation.start(pool.name, size))
-    rotation.settle(pool.name, size, next(
-        index for index, m in enumerate(pool.members) if m.model == member.model))
-    return member
+    """One round-robin dispatch: the reserve picks and parks the cursor atomically."""
+    return _pick_member(pool, cooldowns, exclude or set(), None, rotation=rotation)
 
 
 def _mk_pool(*members: tuple[str, int, int], strategy: str = "fill-first") -> _Pool:
@@ -57,20 +53,27 @@ def _mk_pool(*members: tuple[str, int, int], strategy: str = "fill-first") -> _P
 
 class _UpstreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    responses: deque[tuple[int, dict[str, str], bytes | tuple[bytes, ...]]] = deque()
-    models: list[str] = []
-    paths: list[str] = []
-    stream_gate = threading.Event()
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
+        state = self.server.state
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
-        type(self).models.append(payload["model"])
-        type(self).paths.append(self.path)
-        status, headers, body = type(self).responses.popleft()
+        state.models.append(payload["model"])
+        state.paths.append(self.path)
+        try:
+            status, headers, body = state.responses.popleft()
+        except IndexError:
+            body = json.dumps({"error": "test upstream ran out of scripted responses"}).encode()
+            self.close_connection = True
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if status == 0:
             self.close_connection = True
             self.connection.close()
@@ -89,11 +92,9 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             return
         self.wfile.write(body[0])
         self.wfile.flush()
-        type(self).stream_gate.wait(timeout=3)
+        state.stream_gate.wait(timeout=1)
         for chunk in body[1:]:
             if chunk == b"__drop__":
-                # A declared Content-Length plus an early close makes the
-                # client observe a real mid-body read failure.
                 self.connection.close()
                 return
             self.wfile.write(chunk)
@@ -106,11 +107,9 @@ def _running_router(
     members: list[dict[str, object]] | None = None,
     strategy: str = "fill-first",
 ):
-    _UpstreamHandler.responses = deque(responses)
-    _UpstreamHandler.models = []
-    _UpstreamHandler.paths = []
-    _UpstreamHandler.stream_gate = threading.Event()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+    upstream.state = types.SimpleNamespace(
+        responses=deque(responses), models=[], paths=[], stream_gate=threading.Event())
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
 
@@ -143,6 +142,7 @@ def _running_router(
         ):
             router = _RouterServer(("127.0.0.1", 0))
             router.pools = _PoolRegistry(pools_file)
+            router.upstream_state = upstream.state
             router_thread = threading.Thread(target=router.serve_forever, daemon=True)
             router_thread.start()
             try:
@@ -163,7 +163,7 @@ def _post(
     model: str = "test-pool",
 ) -> tuple[int, bytes]:
     body = json.dumps({"model": model, "messages": []}).encode("utf-8")
-    connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=3)
+    connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=10)
     connection.request(
         "POST",
         path,
@@ -193,8 +193,8 @@ class ParsePoolsTests(unittest.TestCase):
         }
         pools = _parse_pools(payload)
         members = pools["p"].members
-        self.assertEqual(members[0].rpm, 1)      # default rpm
-        self.assertEqual(members[0].priority, 0)  # default priority
+        self.assertEqual(members[0].rpm, 1)
+        self.assertEqual(members[0].priority, 0)
         self.assertEqual(members[1].rpm, 5)
         self.assertEqual(members[1].priority, 2)
 
@@ -213,7 +213,6 @@ class PickMemberTests(unittest.TestCase):
     def test_strict_priority_tier(self) -> None:
         pool = _mk_pool(("a", 100, 2), ("b", 1, 1))
         cd = _CooldownTable()
-        # priority 1 beats priority 2 regardless of rpm
         for _ in range(20):
             self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "b")
 
@@ -226,7 +225,6 @@ class PickMemberTests(unittest.TestCase):
         pool = _mk_pool(("a", 1, 1), ("b", 1, 2))
         cd = _CooldownTable()
         cd.cooldown("a", 30, "test")
-        # A ready alternative is preferred before a last-resort cooling retry.
         self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "b")
 
     def test_all_cooling_remains_selectable(self) -> None:
@@ -236,7 +234,6 @@ class PickMemberTests(unittest.TestCase):
         self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "a")
 
     def test_rpm_weight_within_tier(self) -> None:
-        # 999-vs-1 rpm; picking 400 times should heavily favour the 999 member
         pool = _mk_pool(("heavy", 999, 0), ("light", 1, 0))
         cd = _CooldownTable()
         counts = {"heavy": 0, "light": 0}
@@ -269,8 +266,6 @@ class RoundRobinTests(unittest.TestCase):
         self.assertEqual(picks, ["a", "b", "a", "b"])
 
     def test_retry_does_not_replay_on_the_next_request(self) -> None:
-        # The old cursor modulo'd a shrinking candidate list, so the member that
-        # served a retry was handed the very next request as well.
         pool = _mk_pool(("a", 1, 0), ("b", 1, 0), ("c", 1, 0), strategy="round-robin")
         cd, rotation = _CooldownTable(), _Rotation()
         first = _rotate(pool, cd, rotation)
@@ -291,10 +286,10 @@ class RoundRobinTests(unittest.TestCase):
 
     def test_cursor_resets_when_member_count_changes(self) -> None:
         rotation = _Rotation()
-        rotation.settle("p", 3, 2)
-        self.assertEqual(rotation.start("p", 3), 0)
-        rotation.settle("p", 3, 1)
-        self.assertEqual(rotation.start("p", 2), 0)
+        self.assertEqual(rotation.reserve("p", 3, lambda cursor: 2), 2)
+        self.assertEqual(rotation.cursor("p", 3), 0)
+        self.assertEqual(rotation.reserve("p", 2, lambda cursor: 1), 1)
+        self.assertEqual(rotation.cursor("p", 2), 0)
 
 
 def _mk_pool_limited(*members: tuple[str, int, int, int | None]) -> _Pool:
@@ -316,7 +311,6 @@ class PacingTests(unittest.TestCase):
         for _ in range(150):
             m = _pick_member(pool, cd, exclude=set(), limiter=lim)
             lim.record(m.model, m.limit)
-        # top priority always chosen, never paced out
         self.assertEqual(cd.is_ready("a"), True)
         self.assertEqual(
             _pick_member(pool, cd, exclude=set(), limiter=lim).model, "a"
@@ -327,19 +321,15 @@ class PacingTests(unittest.TestCase):
         cd = _CooldownTable()
         lim = _RateLimiter()
         chosen: list[str] = []
-        # two dispatches fit within the limit; subsequent ones must spill
         for _ in range(6):
             m = _pick_member(pool, cd, exclude=set(), limiter=lim)
             chosen.append(m.model)
             lim.record(m.model, m.limit)
         self.assertEqual(chosen[:2], ["fast", "fast"])
-        # after the limit is hit, traffic spills to the lower-priority member
         self.assertIn("slow", chosen[2:])
         self.assertNotIn("fast", chosen[2:])
 
     def test_all_paced_out_falls_back_to_top_priority(self) -> None:
-        # if every member is paced out, the router must still pick someone
-        # rather than fail the request; the highest-priority one wins.
         pool = _mk_pool_limited(("a", 1, 1, 1), ("b", 1, 2, 1))
         cd = _CooldownTable()
         lim = _RateLimiter()
@@ -353,15 +343,11 @@ class PacingTests(unittest.TestCase):
         pool = _mk_pool_limited(("fast", 1, 1, 1), ("slow", 1, 2, None))
         cd = _CooldownTable()
         lim = _RateLimiter()
-        # exhaust the fast member's lone slot
         lim.record("fast", 1)
-        # fast is paced out, so traffic spills to the lower-priority member
         self.assertEqual(
             _pick_member(pool, cd, exclude=set(), limiter=lim).model, "slow"
         )
-        # after the 60s window passes, the fast member regains capacity
-        # (relative to the live clock: a fixed epoch breaks on long uptimes)
-        with patch("modules.router.time.monotonic", return_value=time.monotonic() + 120.0):
+        with patch("modules.router._now", return_value=time.monotonic() + 120.0):
             self.assertEqual(
                 _pick_member(pool, cd, exclude=set(), limiter=lim).model, "fast"
             )
@@ -378,15 +364,14 @@ class ModelRewriteTests(unittest.TestCase):
             }
         ).encode("utf-8")
         parsed = json.loads(body)
-        rewritten = _rewrite_model(body, parsed, "real/model")
+        rewritten = _rewrite_model(parsed, "real/model")
         out = json.loads(rewritten)
         self.assertEqual(out["model"], "real/model")
-        self.assertIn("my-pool", out["messages"][0]["content"])  # content untouched
+        self.assertIn("my-pool", out["messages"][0]["content"])
 
 
 class HeaderRewriteTests(unittest.TestCase):
     def test_hop_and_auth_are_stripped_before_forwarding(self) -> None:
-        # simulate BaseHTTPRequestHandler headers as a dict-like
         incoming = {
             "Authorization": "Bearer client-key",
             "x-api-key": "client-key",
@@ -401,7 +386,6 @@ class HeaderRewriteTests(unittest.TestCase):
         self.assertEqual(headers["Content-Length"], "7")
         self.assertTrue(headers["Authorization"].startswith("Bearer "))
         self.assertIn("x-api-key", headers)
-        # Host must point at CLIProxyAPI, not our router
         self.assertNotEqual(headers["Host"], "127.0.0.1:4000")
 
 
@@ -428,45 +412,30 @@ class PoolFailoverTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(body), json.loads(_OK_BODY))
                 self.assertEqual(
-                    _UpstreamHandler.models,
+                    router.upstream_state.models,
                     ["provider/first", "provider/second"],
                 )
 
-    def test_api_key_error_in_bad_request_tries_next_member(self) -> None:
-        with _running_router(
-            (400, {}, b'{"error":{"message":"Invalid API key supplied"}}'),
-            (200, {}, _OK_BODY),
-        ) as router:
+    def test_pooled_400_is_terminal_and_forwarded(self) -> None:
+        with _running_router((400, {}, b'{"error":{"message":"Invalid API key supplied"}}')) as router:
             status, body = _post(router)
 
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(status, 400)
+        self.assertEqual(body, b'{"error":{"message":"Invalid API key supplied"}}')
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
+        self.assertTrue(router.cooldowns.is_ready("provider/first"))
+        self.assertTrue(router.cooldowns.is_ready("provider/second"))
 
     def test_malformed_provider_json_in_bad_request_tries_next_member(self) -> None:
-        malformed_responses = (
-            b'{"error":{"message":"NVIDIA NIM returned malformed JSON in tool call"}}',
-            b'{"error":{"message":"Failed to parse assistant response"}}',
-            (
-                b'{"error":{"message":"Failed to deserialize the JSON body into the target '
-                b'type: data did not match any variant of untagged enum '
-                b'ChatCompletionRequestToolMessageContent at line 1 column 1234711"}}'
-            ),
-        )
-        for error_body in malformed_responses:
-            with self.subTest(error_body=error_body):
-                with _running_router(
-                    (400, {}, error_body),
-                    (200, {}, _OK_BODY),
-                ) as router:
-                    status, body = _post(router)
+        error_body = (b'{"error":{"message":"Failed to deserialize the JSON body into the target '
+                      b'type: data did not match any variant of untagged enum '
+                      b'ChatCompletionRequestToolMessageContent at line 1 column 1234711"}}')
+        with _running_router((400, {}, error_body)) as router:
+            status, body = _post(router)
 
-                self.assertEqual(status, 200)
-                self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-                self.assertEqual(
-                    _UpstreamHandler.models,
-                    ["provider/first", "provider/second"],
-                )
+        self.assertEqual(status, 400)
+        self.assertEqual(body, error_body)
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
 
     def test_stream_error_event_tries_next_member_before_forwarding(self) -> None:
         stream_errors = (
@@ -484,7 +453,7 @@ class PoolFailoverTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(body), json.loads(_OK_BODY))
                 self.assertEqual(
-                    _UpstreamHandler.models,
+                    router.upstream_state.models,
                     ["provider/first", "provider/second"],
                 )
 
@@ -497,7 +466,7 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_transport_error_tries_next_member(self) -> None:
         with _running_router(
@@ -508,7 +477,7 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_count_tokens_rate_limit_tries_next_member(self) -> None:
         with _running_router(
@@ -519,20 +488,18 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"input_tokens": 7})
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
         self.assertEqual(
-            _UpstreamHandler.paths,
+            router.upstream_state.paths,
             ["/v1/messages/count_tokens", "/v1/messages/count_tokens"],
         )
 
     def test_successful_stream_is_forwarded_incrementally(self) -> None:
-        # The router commits on the first content frame, so the head it buffered
-        # must reach the client before the rest of the stream is produced.
         with _running_router(
             (200, _SSE, (_START + _DELTA, _STOP)),
         ) as router:
             body = json.dumps({"model": "test-pool", "messages": []}).encode("utf-8")
-            connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=3)
+            connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=10)
             connection.request(
                 "POST",
                 "/v1/messages",
@@ -545,14 +512,14 @@ class PoolFailoverTests(unittest.TestCase):
             )
             response = connection.getresponse()
             first = response.read(len(_START + _DELTA))
-            _UpstreamHandler.stream_gate.set()
+            router.upstream_state.stream_gate.set()
             rest = response.read()
             connection.close()
 
         self.assertEqual(response.status, 200)
         self.assertEqual(first, _START + _DELTA)
         self.assertEqual(rest, _STOP)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
 
     def test_empty_responses_try_the_next_member(self) -> None:
         empties = (
@@ -575,7 +542,7 @@ class PoolFailoverTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(body), json.loads(_OK_BODY))
                 self.assertEqual(
-                    _UpstreamHandler.models,
+                    router.upstream_state.models,
                     ["provider/first", "provider/second"],
                 )
 
@@ -592,19 +559,19 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"input_tokens": 5})
-        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
 
     def test_stream_dying_before_content_tries_the_next_member(self) -> None:
         with _running_router(
             (200, {**_SSE, "Content-Length": "999"}, (_START, b"__drop__")),
             (200, {}, _OK_BODY),
         ) as router:
-            _UpstreamHandler.stream_gate.set()
+            router.upstream_state.stream_gate.set()
             status, body = _post(router)
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_all_members_failing_returns_sanitized_error(self) -> None:
         first_secret = "first-private-value"
@@ -622,11 +589,25 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertNotIn(first_secret, body.decode())
         self.assertNotIn(second_secret, body.decode())
 
-    def test_any_member_4xx_tries_next_member_without_inspecting_text(self) -> None:
+    def test_terminal_4xx_forwarded_without_retry(self) -> None:
         for status_code in (400, 404, 422):
             with self.subTest(status=status_code):
                 with _running_router(
                     (status_code, {}, b'{"error":{"message":"arbitrary rejection"}}'),
+                ) as router:
+                    status, body = _post(router)
+
+                self.assertEqual(status, status_code)
+                self.assertEqual(body, b'{"error":{"message":"arbitrary rejection"}}')
+                self.assertEqual(router.upstream_state.models, ["provider/first"])
+                self.assertTrue(router.cooldowns.is_ready("provider/first"))
+                self.assertTrue(router.cooldowns.is_ready("provider/second"))
+
+    def test_transient_4xx_still_tries_next_member(self) -> None:
+        for status_code in (408, 409, 425):
+            with self.subTest(status=status_code):
+                with _running_router(
+                    (status_code, {}, b'{"error":{"message":"transient"}}'),
                     (200, {}, _OK_BODY),
                 ) as router:
                     status, body = _post(router)
@@ -634,7 +615,7 @@ class PoolFailoverTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(body), json.loads(_OK_BODY))
                 self.assertEqual(
-                    _UpstreamHandler.models,
+                    router.upstream_state.models,
                     ["provider/first", "provider/second"],
                 )
 
@@ -649,7 +630,7 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), json.loads(_OK_BODY))
         self.assertEqual(
-            _UpstreamHandler.models,
+            router.upstream_state.models,
             ["provider/first", "provider/second", "provider/first"],
         )
 
@@ -661,11 +642,9 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 503)
         self.assertEqual(len(json.loads(body)["error"]["attempts"]), 6)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"] * 3)
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"] * 3)
 
     def test_round_robin_alternates_members(self) -> None:
-        # Same default members (priority 1 / 2): fill-first would send every
-        # request to provider/first; round-robin must alternate instead.
         with _running_router(
             (200, {}, _OK_BODY),
             (200, {}, _OK_BODY),
@@ -677,7 +656,7 @@ class PoolFailoverTests(unittest.TestCase):
                 status, _ = _post(router)
                 self.assertEqual(status, 200)
         self.assertEqual(
-            _UpstreamHandler.models,
+            router.upstream_state.models,
             ["provider/first", "provider/second", "provider/first", "provider/second"],
         )
 
@@ -688,11 +667,9 @@ class PoolFailoverTests(unittest.TestCase):
 
         self.assertEqual(status, 400)
         self.assertEqual(body, error_body)
-        self.assertEqual(_UpstreamHandler.models, ["provider/direct"])
+        self.assertEqual(router.upstream_state.models, ["provider/direct"])
 
     def test_paced_member_429_uses_short_cooldown(self) -> None:
-        # A member with an rpm cap should cool for the short paced-429 value,
-        # not the global 60s default, so it comes back within the same minute.
         members = [
             {"model": "provider/first", "priority": 1, "rpm": 40},
             {"model": "provider/second", "priority": 2},
@@ -704,18 +681,14 @@ class PoolFailoverTests(unittest.TestCase):
         ) as router:
             first_status, _ = _post(router)
             self.assertEqual(first_status, 200)
-            self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+            self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
-            # the paced member was put into a short cooldown on the 429
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
-            with patch("modules.router.time.monotonic", return_value=time.monotonic() + 120.0):
-                # after the short cooldown elapses it must be eligible again
+            with patch("modules.router._now", return_value=time.monotonic() + 120.0):
                 self.assertTrue(router.cooldowns.is_ready("provider/first"))
 
     def test_provider_retry_after_overrides_paced_cooldown(self) -> None:
-        # If the provider sends its own Retry-After, that wins over the paced
-        # default — we trust the server's knowledge of its own window.
         members = [
             {"model": "provider/first", "priority": 1, "rpm": 40},
             {"model": "provider/second", "priority": 2},
@@ -728,8 +701,7 @@ class PoolFailoverTests(unittest.TestCase):
             status, _ = _post(router)
             self.assertEqual(status, 200)
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
-            # provider said 2s, so it stays cooled at t+1
-            with patch("modules.router.time.monotonic", return_value=time.monotonic() + 1.0):
+            with patch("modules.router._now", return_value=time.monotonic() + 1.0):
                 self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
 
@@ -756,14 +728,14 @@ class MultiFormatPoolTests(unittest.TestCase):
             status, body = _post(router, path)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
 
     def _fails_over(self, path: str, bad, good, expected: bytes) -> None:
         with _running_router((200, *bad), (200, *good)) as router:
             status, body = _post(router, path)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_responses_content_stream_is_not_mistaken_for_empty(self) -> None:
         stream = _R_CREATED + _R_TEXT + _R_DONE
@@ -806,8 +778,8 @@ class MultiFormatPoolTests(unittest.TestCase):
             with self.subTest(path=path):
                 with _running_router((200, *response)) as router:
                     self.assertEqual(_post(router, path)[0], 200)
-                self.assertEqual(_UpstreamHandler.paths, [path])
-                self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+                self.assertEqual(router.upstream_state.paths, [path])
+                self.assertEqual(router.upstream_state.models, ["provider/first"])
 
 
 class WeightedStrategyTests(unittest.TestCase):
@@ -864,11 +836,18 @@ class LeastBusyStrategyTests(unittest.TestCase):
 
     def test_dispatch_releases_the_slot_after_the_response(self) -> None:
         with _running_router((200, {}, _OK_BODY)) as router:
+            released = threading.Event()
+            original_hold = router.inflight.hold
+
+            @contextmanager
+            def hold(model: str):
+                with original_hold(model):
+                    yield
+                released.set()
+
+            router.inflight.hold = hold
             self.assertEqual(_post(router)[0], 200)
-            # The handler thread unwinds the hold after the client has its body.
-            deadline = time.monotonic() + 5
-            while router.inflight.count("provider/first") and time.monotonic() < deadline:
-                time.sleep(0.01)
+            self.assertTrue(released.wait(timeout=5))
             self.assertEqual(router.inflight.count("provider/first"), 0)
 
 

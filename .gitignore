@@ -22,6 +22,7 @@ data/*.log
 data/*.pid
 data/*.err
 data/*.tmp
+data/*.lock
 tmp/
 
 # Editors

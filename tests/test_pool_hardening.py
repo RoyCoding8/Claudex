@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from modules.pool_tui import _edit_members_flow
-from modules.pools import ModelPool, PoolMember, load_pools, save_pools
+from modules.pools import _LOADED_DIGESTS, ModelPool, PoolMember, load_pools, save_pools
 
 
 class PoolHardeningTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        _LOADED_DIGESTS.clear()
+
     def test_priority_zero_and_single_member_pool_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pools.json"
@@ -37,12 +39,12 @@ class PoolHardeningTests(unittest.TestCase):
                 save_pools([], path)
 
     def test_editing_a_member_preserves_limit_and_cooldown(self) -> None:
-        members = [PoolMember("a/x", 10, 20, 0, 30, 15.0), PoolMember("b/x")]
+        members = [PoolMember("a/x", rpm=10, priority=0, limit=30, cooldown=15.0), PoolMember("b/x")]
         actions = iter([type("Action", (), {"kind": "edit", "index": 0})(), type("Action", (), {"kind": "cancel", "index": -1})()])
         with (
             patch("modules.pool_tui._member_editor_tui", side_effect=lambda *_: next(actions)),
             patch("modules.pool_tui._clear"),
-            patch("modules.pool_tui._prompt_int", side_effect=[11, 21, 0]),
+            patch("modules.pool_tui._prompt_int", side_effect=[11, 0]),
         ):
             _edit_members_flow("p", members, [])
         self.assertEqual(members[0].limit, 30)

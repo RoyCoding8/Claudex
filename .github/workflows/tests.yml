@@ -24,4 +24,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
+      - run: uv run ruff check modules cx.py tests
+      - run: uv run mypy modules
       - run: uv run python -m unittest discover tests

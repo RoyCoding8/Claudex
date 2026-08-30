@@ -1,13 +1,24 @@
 from __future__ import annotations
 
-import os
-import signal
 import socket
 import subprocess
+import sys
 import time
+from pathlib import Path
 
-from .config import DATA_DIR, PROXY_CONFIG, PROXY_EXE, PROXY_LOG, PROXY_PID, PROXY_START_TIMEOUT, PROXY_HOST, PROXY_PORT
+from .config import DATA_DIR, PROXY_CONFIG, PROXY_EXE, PROXY_HOST, PROXY_LOG, PROXY_PID, PROXY_PORT, PROXY_START_TIMEOUT
 from .models import fetch_upstream_models
+
+_LOG_ROTATE_BYTES = 5_000_000
+
+
+def _rotate_spawn_log(path: Path) -> None:
+    """A child process holds its log open, so rotation must happen before spawn."""
+    try:
+        if path.exists() and path.stat().st_size > _LOG_ROTATE_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
 
 
 def _port_is_open() -> bool:
@@ -26,29 +37,6 @@ def proxy_is_ready() -> bool:
         return False
 
 
-def _read_pid() -> int | None:
-    try:
-        return int(PROXY_PID.read_text(encoding="ascii").strip())
-    except (OSError, ValueError):
-        return None
-
-
-def stop_proxy() -> bool:
-    """Stop only the instance launched by cx, if its PID is still live."""
-    pid = _read_pid()
-    if not pid:
-        return False
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return False
-    PROXY_PID.unlink(missing_ok=True)
-    return True
-
-
 def ensure_proxy() -> None:
     if proxy_is_ready():
         return
@@ -58,8 +46,12 @@ def ensure_proxy() -> None:
     if not PROXY_EXE.is_file():
         raise RuntimeError(f"CLIProxyAPI executable not found:\n{PROXY_EXE}")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        flags = 0
     command = [str(PROXY_EXE)] + (["--config", str(PROXY_CONFIG)] if PROXY_CONFIG.is_file() else [])
+    _rotate_spawn_log(PROXY_LOG)
     with PROXY_LOG.open("ab") as log:
         process = subprocess.Popen(command, cwd=str(PROXY_EXE.parent), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, creationflags=flags, close_fds=True)
     PROXY_PID.write_text(str(process.pid), encoding="ascii")

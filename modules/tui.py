@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import threading
+import time
 from dataclasses import dataclass
 
 from prompt_toolkit import Application
@@ -13,6 +17,7 @@ from prompt_toolkit.styles import Style
 
 from .config import DATA_DIR, SETTINGS_EXAMPLE_FILE, SETTINGS_FILE
 from .models import CATEGORIES, Model, filter_models
+
 
 @dataclass(slots=True)
 class PickerResult:
@@ -50,32 +55,56 @@ def get_model_context(model_id: str) -> int | None:
     value = _model_settings_for(model_id).get("context_tokens")
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
+_SETTINGS_DIGEST: str | None = None
+_SETTINGS_WARNINGS: list[str] = []
+
+
+def _drain_settings_warnings() -> list[str]:
+    warnings = _SETTINGS_WARNINGS[:]
+    _SETTINGS_WARNINGS.clear()
+    return warnings
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _load_settings() -> dict:
-    if not SETTINGS_FILE.exists() and SETTINGS_EXAMPLE_FILE.is_file():
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_bytes(SETTINGS_EXAMPLE_FILE.read_bytes())
+    global _SETTINGS_DIGEST
     try:
-        with SETTINGS_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-            return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        # If the user made a syntax error manually editing, don't silently wipe it!
-        # Back it up and return an empty dict so they don't lose their file completely.
-        import time
+        if not SETTINGS_FILE.exists() and SETTINGS_EXAMPLE_FILE.is_file():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_bytes(SETTINGS_EXAMPLE_FILE.read_bytes())
+        raw = SETTINGS_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        _SETTINGS_DIGEST = _digest(raw)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _SETTINGS_DIGEST = None
         if SETTINGS_FILE.exists():
             backup_path = SETTINGS_FILE.with_suffix(f".broken_{int(time.time())}.json")
-            SETTINGS_FILE.rename(backup_path)
-            print(f"\nWARNING: settings.json had a syntax error! Backed up to {backup_path.name}")
+            os.replace(SETTINGS_FILE, backup_path)
+            _SETTINGS_WARNINGS.append(f"settings.json was corrupt; backed up to {backup_path.name}")
         return {}
-    except (FileNotFoundError, OSError):
+    except OSError:
+        _SETTINGS_DIGEST = None
         return {}
 
 
 def _save_settings(data: dict) -> None:
+    global _SETTINGS_DIGEST
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if _SETTINGS_DIGEST is not None:
+        try:
+            actual = _digest(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            actual = ""
+        if actual != _SETTINGS_DIGEST:
+            raise RuntimeError("settings.json changed on disk; reload before saving so no edits are lost.")
     temporary = SETTINGS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SETTINGS_FILE)
+    _SETTINGS_DIGEST = _digest(json.dumps(data, indent=2) + "\n")
 
 
 def _prompt_context_tokens(current: int | None) -> int | None:
@@ -113,6 +142,8 @@ def _prompt_auto_compact(current: bool | None) -> bool | None:
 def configure_model_parameters(model_id: str) -> None:
     """Edit the selected model's supported settings without touching other keys."""
     settings = _load_settings()
+    for warning in _drain_settings_warnings():
+        print(f"  {warning}")
     all_models = settings.get("model_settings")
     if not isinstance(all_models, dict):
         all_models = {}
@@ -162,30 +193,10 @@ def set_extra_model(key: str, value: str | None) -> None:
         settings[key] = value
     _save_settings(settings)
 
-def configure_extra_models() -> None:
-    settings = _load_settings()
-    print("\n--- Configure Extra Models for GPT ---")
-    print("Leave blank to keep current, type 'clear' to reset to defaults.")
-    
-    current_fast = settings.get("gpt_fast_model", "")
-    new_fast = input(f"Fast/Haiku model ID [{current_fast}]: ").strip()
-    if new_fast.lower() == "clear":
-        settings.pop("gpt_fast_model", None)
-    elif new_fast:
-        settings["gpt_fast_model"] = new_fast
-        
-    current_med = settings.get("gpt_medium_model", "")
-    new_med = input(f"Medium/Sonnet/Subagent model ID [{current_med}]: ").strip()
-    if new_med.lower() == "clear":
-        settings.pop("gpt_medium_model", None)
-    elif new_med:
-        settings["gpt_medium_model"] = new_med
-        
-    _save_settings(settings)
-
 
 def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: bool = False) -> PickerResult:
     settings = _load_settings()
+    load_warnings = _drain_settings_warnings()
     category = str(settings.get("category", "All"))
     if category not in CATEGORIES:
         category = "All"
@@ -198,13 +209,19 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
     selected_index = 0
     visible_models: list[Model] = []
 
-    # Cache router status once — never do network I/O in render functions.
-    gw_status = False
+    application: Application[PickerResult] | None = None
+
+    gw_status, gw_checked = False, sub_picker
     if not sub_picker:
         from .router_starter import router_is_ready
-        gw_status = router_is_ready()
 
-    application: Application[PickerResult] | None = None
+        def _probe_gateway() -> None:
+            nonlocal gw_status, gw_checked
+            gw_status, gw_checked = router_is_ready(), True
+            if application is not None:
+                application.invalidate()
+
+        threading.Thread(target=_probe_gateway, daemon=True).start()
 
     def persist(model: Model | None = None) -> None:
         if sub_picker:
@@ -217,6 +234,11 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         current["skip_permissions"] = skip_permissions
         current["last_model"] = last_model
         _save_settings(current)
+
+    def _result(action: str, model: Model | None = None, context_tokens: int | None = None,
+                auto_compact: bool | None = None) -> PickerResult:
+        return PickerResult(action, model, skip_permissions, context_tokens, auto_compact,
+                            gpt_fast_model, gpt_medium_model, gpt_subagent_model)
 
     def selected_model() -> Model | None:
         if not visible_models:
@@ -264,6 +286,9 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         ]
         if not sub_picker:
             parts.append(("", "\n"))
+            if load_warnings:
+                for warning in load_warnings:
+                    parts.append(("class:danger", f"{warning}  "))
             fast_style = "class:accent" if gpt_fast_model else "class:muted"
             med_style = "class:accent" if gpt_medium_model else "class:muted"
             sub_style = "class:accent" if gpt_subagent_model else "class:muted"
@@ -274,9 +299,13 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
                 (med_style, gpt_medium_model or "default"),
                 ("class:label", "   Subagent: "),
                 (sub_style, gpt_subagent_model or "default"),
-                ("class:label", "   GW: "),
-                ("class:safe" if gw_status else "class:danger", "\u25cf" if gw_status else "\u25cb"),
             ])
+            parts.append(("class:label", "   GW: "))
+            if gw_checked:
+                parts.append(("class:safe" if gw_status else "class:danger",
+                              "\u25cf" if gw_status else "\u25cb"))
+            else:
+                parts.append(("class:muted", "\u25cb\u2026 checking"))
         return parts
 
     def model_text():
@@ -380,61 +409,32 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
 
     bindings = KeyBindings()
 
-    @bindings.add("up")
-    def _up(event) -> None:
+    def _move(event, delta: int) -> None:
         nonlocal selected_index
         if visible_models:
-            selected_index = max(0, selected_index - 1)
+            selected_index = min(len(visible_models) - 1, max(0, selected_index + delta))
             event.app.invalidate()
 
-    @bindings.add("down")
-    def _down(event) -> None:
-        nonlocal selected_index
-        if visible_models:
-            selected_index = min(len(visible_models) - 1, selected_index + 1)
-            event.app.invalidate()
-
-    @bindings.add("pageup")
-    def _page_up(event) -> None:
-        nonlocal selected_index
-        selected_index = max(0, selected_index - 10)
-        event.app.invalidate()
-
-    @bindings.add("pagedown")
-    def _page_down(event) -> None:
-        nonlocal selected_index
-        if visible_models:
-            selected_index = min(len(visible_models) - 1, selected_index + 10)
-            event.app.invalidate()
+    for key, delta in (("up", -1), ("down", 1), ("pageup", -10), ("pagedown", 10)):
+        bindings.add(key)(lambda event, _delta=delta: _move(event, _delta))
 
     @bindings.add("home")
     def _home(event) -> None:
-        nonlocal selected_index
-        selected_index = 0
-        event.app.invalidate()
+        _move(event, -(1 << 60))
 
     @bindings.add("end")
     def _end(event) -> None:
-        nonlocal selected_index
-        if visible_models:
-            selected_index = len(visible_models) - 1
-            event.app.invalidate()
+        _move(event, 1 << 60)
 
-    @bindings.add("tab")
-    def _next_category(event) -> None:
+    def _shift_category(event, step: int) -> None:
         nonlocal category
-        current_id = selected_model().id if selected_model() else None
-        category = CATEGORIES[(CATEGORIES.index(category) + 1) % len(CATEGORIES)]
-        refresh_visible(current_id)
+        current = selected_model()
+        category = CATEGORIES[(CATEGORIES.index(category) + step) % len(CATEGORIES)]
+        refresh_visible(current.id if current else None)
         event.app.invalidate()
 
-    @bindings.add("s-tab")
-    def _previous_category(event) -> None:
-        nonlocal category
-        current_id = selected_model().id if selected_model() else None
-        category = CATEGORIES[(CATEGORIES.index(category) - 1) % len(CATEGORIES)]
-        refresh_visible(current_id)
-        event.app.invalidate()
+    bindings.add("tab")(lambda event: _shift_category(event, 1))
+    bindings.add("s-tab")(lambda event: _shift_category(event, -1))
 
     @bindings.add("c-s")
     def _toggle_permissions(event) -> None:
@@ -447,35 +447,15 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
     @bindings.add("c-r")
     def _refresh(event) -> None:
         persist(selected_model())
-        _exit_once(event, PickerResult("refresh", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+        _exit_once(event, _result("refresh"))
 
-    @bindings.add("f6")
-    def _config(event) -> None:
-        if sub_picker:
-            return
-        persist(selected_model())
-        _exit_once(event, PickerResult("configure", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
-
-    @bindings.add("f7")
-    def _pools(event) -> None:
-        if sub_picker:
-            return
-        persist(selected_model())
-        _exit_once(event, PickerResult("pools", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
-
-    @bindings.add("f8")
-    def _management(event) -> None:
-        if sub_picker:
-            return
-        persist(selected_model())
-        _exit_once(event, PickerResult("management", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
-
-    @bindings.add("f9")
-    def _gateway(event) -> None:
-        if sub_picker:
-            return
-        persist(selected_model())
-        _exit_once(event, PickerResult("gateway", None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+    for key, action in (("f6", "configure"), ("f7", "pools"), ("f8", "management"), ("f9", "gateway")):
+        @bindings.add(key)
+        def _function_key(event, _action: str = action) -> None:
+            if sub_picker:
+                return
+            persist(selected_model())
+            _exit_once(event, _result(_action))
 
     @bindings.add("f10")
     def _model_parameters(event) -> None:
@@ -484,19 +464,22 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         model = selected_model()
         if model is not None:
             persist(model)
-            _exit_once(event, PickerResult("model_parameters", model, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+            _exit_once(event, _result("model_parameters", model))
 
     @bindings.add("delete")
     def _clear_selection(event) -> None:
         if sub_picker:
             _exit_once(event, PickerResult("clear", None, skip_permissions, None, None, None, None, None))
+        elif search_buffer.text:
+            search_buffer.text = ""
+            event.app.invalidate()
 
     @bindings.add("enter")
     def _launch(event) -> None:
         model = selected_model()
         if model:
             persist(model)
-            _exit_once(event, PickerResult("launch", model, skip_permissions, get_model_context(model.id), get_model_autocompact(model.id), gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+            _exit_once(event, _result("launch", model, get_model_context(model.id), get_model_autocompact(model.id)))
 
     @bindings.add("escape")
     def _escape(event) -> None:
@@ -504,8 +487,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
             search_buffer.text = ""
         else:
             persist(selected_model())
-            action = "cancel" if sub_picker else "exit"
-            _exit_once(event, PickerResult(action, None, skip_permissions, None, None, gpt_fast_model, gpt_medium_model, gpt_subagent_model))
+            _exit_once(event, _result("cancel" if sub_picker else "exit"))
 
     style = Style.from_dict(
         {

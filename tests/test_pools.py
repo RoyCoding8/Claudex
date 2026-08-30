@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from modules.models import Model, category_for
 from modules.pools import (
+    _LOADED_DIGESTS,
     ModelPool,
     PoolMember,
     ensure_default_pools_file,
@@ -19,13 +20,16 @@ from modules.pools import (
 
 
 class PoolTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        _LOADED_DIGESTS.clear()
+
     def test_round_trip(self) -> None:
         pools = [
             ModelPool(
                 "glm-pool",
                 (
-                    PoolMember("nv/glm", 40, None, 1),
-                    PoolMember("other/glm", 50, 100000, 2),
+                    PoolMember("nv/glm", rpm=40, priority=1),
+                    PoolMember("other/glm", rpm=50, priority=2),
                 ),
             )
         ]
@@ -83,9 +87,6 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(names, {"on"})
 
     def test_partial_priorities_are_allowed(self) -> None:
-        # The old LiteLLM-era check required either all-or-none priorities and
-        # rejected ties. The router doesn't care — it uses priority as a tier
-        # and rpm as tiebreaker weight.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pools.json"
             path.write_text(
@@ -151,7 +152,7 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(raw["pools"][0]["strategy"], "round-robin")
         self.assertNotIn("strategy", raw["pools"][1])
 
-    def test_rejects_unknown_strategy(self) -> None:
+    def test_unknown_strategy_is_coerced_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pools.json"
             path.write_text(
@@ -169,8 +170,10 @@ class PoolTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "strategy"):
-                load_pools(path)
+            with self.assertLogs("cx.pools", level="WARNING"):
+                pools = load_pools(path)
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].strategy, "fill-first")
 
     def test_conflict_with_upstream_id_raises(self) -> None:
         pools = [ModelPool("nv/glm", (PoolMember("a/x"), PoolMember("b/x")))]
@@ -183,6 +186,24 @@ class PoolTests(unittest.TestCase):
         upstream = [Model("a/x", "prov")]
         warnings = validate_pools_against_models(pools, upstream)
         self.assertTrue(warnings and "b/x" in warnings[0])
+
+
+    def test_save_against_unreadable_file_raises_actionable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pools.json"
+            path.write_text('{"pools": []}', encoding="utf-8")
+            load_pools(path)
+            path.write_bytes(b'\xff\xfe corrupted between load and save')
+            with self.assertRaisesRegex(RuntimeError, "unreadable"):
+                save_pools([], path)
+
+    def test_load_failure_does_not_record_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pools.json"
+            path.write_text('{"pools": [broken', encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                load_pools(path)
+            self.assertNotIn(path, _LOADED_DIGESTS)
 
 
 if __name__ == "__main__":

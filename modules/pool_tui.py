@@ -13,15 +13,16 @@ from prompt_toolkit.styles import Style
 
 from .models import Model
 from .pools import (
+    POOLS_FILE,
     STRATEGIES,
     ModelPool,
     PoolMember,
+    adopt_current_pools_digest,
     ensure_default_pools_file,
     load_pools,
     save_pools,
 )
 
-# Matches the main model picker aesthetic.
 _STYLE = Style.from_dict(
     {
         "": "bg:#111318 #d7dae0",
@@ -48,9 +49,6 @@ def _clear() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
 
-# ── Inline prompts ──────────────────────────────────────────────────
-
-
 def _prompt_text(label: str, default: str = "") -> str | None:
     """Simple line prompt.  Returns *None* when the user leaves it blank
     and no default is set, or on Ctrl-C / Ctrl-D."""
@@ -75,7 +73,7 @@ def _prompt_int(
         try:
             raw = input(f"  {label}{opt}{suffix}: ").strip()
         except (KeyboardInterrupt, EOFError):
-            return default
+            return None
         if not raw:
             if default is not None:
                 return default
@@ -107,12 +105,9 @@ def _prompt_strategy(default: str = STRATEGIES[0]) -> str | None:
         print(f"  Enter one of: {', '.join(STRATEGIES)}.")
 
 
-# ── Pool list TUI ───────────────────────────────────────────────────
-
-
 @dataclass
 class _PoolAction:
-    kind: str  # back | add | edit | toggle | delete
+    kind: str
     index: int = -1
 
 
@@ -128,8 +123,6 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
     @Condition
     def deleting() -> bool:
         return confirming
-
-    # ── content generators ──
 
     def header_text():
         return [
@@ -199,8 +192,6 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
             ("class:muted", "back"),
         ]
 
-    # ── layout ──
-
     header = Window(FormattedTextControl(header_text), height=3, style="class:header")
     body = Window(
         FormattedTextControl(body_text, get_cursor_position=cursor_pos, focusable=False),
@@ -220,49 +211,24 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
         ]
     )
 
-    # ── key bindings ──
-
     kb = KeyBindings()
 
-    @kb.add("up", filter=normal)
-    def _up(event) -> None:
+    def _move(event, delta: int) -> None:
         nonlocal selected
         if pools:
-            selected = max(0, selected - 1)
+            selected = min(len(pools) - 1, max(0, selected + delta))
             event.app.invalidate()
 
-    @kb.add("down", filter=normal)
-    def _down(event) -> None:
-        nonlocal selected
-        if pools:
-            selected = min(len(pools) - 1, selected + 1)
-            event.app.invalidate()
-
-    @kb.add("pageup", filter=normal)
-    def _pgup(event) -> None:
-        nonlocal selected
-        selected = max(0, selected - 10)
-        event.app.invalidate()
-
-    @kb.add("pagedown", filter=normal)
-    def _pgdn(event) -> None:
-        nonlocal selected
-        if pools:
-            selected = min(len(pools) - 1, selected + 10)
-            event.app.invalidate()
+    for key, delta in (("up", -1), ("down", 1), ("pageup", -10), ("pagedown", 10)):
+        kb.add(key, filter=normal)(lambda event, _delta=delta: _move(event, _delta))
 
     @kb.add("home", filter=normal)
     def _home(event) -> None:
-        nonlocal selected
-        selected = 0
-        event.app.invalidate()
+        _move(event, -(1 << 60))
 
     @kb.add("end", filter=normal)
     def _end(event) -> None:
-        nonlocal selected
-        if pools:
-            selected = len(pools) - 1
-            event.app.invalidate()
+        _move(event, 1 << 60)
 
     @kb.add("a", filter=normal)
     def _add(event) -> None:
@@ -290,8 +256,6 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
     def _back(event) -> None:
         event.app.exit(_PoolAction("back"))
 
-    # Delete-confirmation mode: only Y confirms, everything else cancels.
-
     @kb.add("y", filter=deleting)
     def _confirm_delete(event) -> None:
         event.app.exit(_PoolAction("delete", selected))
@@ -302,7 +266,7 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
         confirming = False
         event.app.invalidate()
 
-    app = Application(
+    app: Application = Application(
         layout=Layout(root),
         key_bindings=kb,
         style=_STYLE,
@@ -314,12 +278,9 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
     return app.run()
 
 
-# ── Member editor TUI ───────────────────────────────────────────────
-
-
 @dataclass
 class _MemberAction:
-    kind: str  # save | cancel | add | edit
+    kind: str
     index: int = -1
     members: tuple[PoolMember, ...] = ()
 
@@ -328,12 +289,17 @@ def _member_editor_tui(
     pool_name: str,
     members: list[PoolMember],
 ) -> _MemberAction:
-    """Full-screen member list for a single pool.
-
-    Deletions happen inline (the list is mutated); add/edit exit the TUI
-    so the caller can run model-picker / prompts before re-entering.
-    """
+    """Full-screen member list for a single pool."""
     selected = 0
+    confirming = False
+
+    @Condition
+    def normal() -> bool:
+        return not confirming
+
+    @Condition
+    def deleting() -> bool:
+        return confirming
 
     def header_text():
         rpms = [m.rpm for m in members if m.rpm]
@@ -362,9 +328,8 @@ def _member_editor_tui(
             style = "class:selected" if sel else "class:item"
 
             rpm_str = f"{member.rpm:,} RPM" if member.rpm else "auto"
-            tpm_str = f"  {member.tpm:,} TPM" if member.tpm else ""
-            pri_str = f"  [Priority: {member.priority}]" if member.priority else ""
-            detail = f"  {rpm_str}{tpm_str}{pri_str}"
+            pri_str = f"  [Priority: {member.priority}]" if member.priority is not None else ""
+            detail = f"  {rpm_str}{pri_str}"
 
             parts.append((style, prefix + member.model))
             parts.append(("class:muted" if not sel else style, detail))
@@ -376,9 +341,16 @@ def _member_editor_tui(
         return Point(0, selected)
 
     def footer_text():
+        if confirming and members:
+            return [
+                ("class:danger", f" Delete '{members[selected].model}'?  "),
+                ("class:key", "Y "),
+                ("class:muted", "confirm  "),
+                ("class:muted", "any other key cancels"),
+            ]
         parts: list[tuple[str, str]] = []
-        if 0 < len(members) < 2:
-            parts.append(("class:warn", " ⚠ Need ≥2 members to save  "))
+        if not members:
+            parts.append(("class:warn", " ⚠ Add at least one member to save  "))
         parts.extend(
             [
                 ("class:key", " ↑↓ "),
@@ -418,62 +390,56 @@ def _member_editor_tui(
 
     kb = KeyBindings()
 
-    @kb.add("up")
-    def _up(event) -> None:
+    def _move(event, delta: int) -> None:
         nonlocal selected
         if members:
-            selected = max(0, selected - 1)
+            selected = min(len(members) - 1, max(0, selected + delta))
             event.app.invalidate()
 
-    @kb.add("down")
-    def _down(event) -> None:
-        nonlocal selected
-        if members:
-            selected = min(len(members) - 1, selected + 1)
-            event.app.invalidate()
+    for key, delta in (("up", -1), ("down", 1), ("pageup", -10), ("pagedown", 10)):
+        kb.add(key)(lambda event, _delta=delta: _move(event, _delta))
 
-    @kb.add("pageup")
-    def _pgup(event) -> None:
-        nonlocal selected
-        selected = max(0, selected - 10)
-        event.app.invalidate()
-
-    @kb.add("pagedown")
-    def _pgdn(event) -> None:
-        nonlocal selected
-        if members:
-            selected = min(len(members) - 1, selected + 10)
-            event.app.invalidate()
-
-    @kb.add("a")
+    @kb.add("a", filter=normal)
     def _add(event) -> None:
         event.app.exit(_MemberAction("add"))
 
-    @kb.add("e")
+    @kb.add("e", filter=normal)
     def _edit(event) -> None:
         if members:
             event.app.exit(_MemberAction("edit", selected))
 
-    @kb.add("d")
-    def _delete(event) -> None:
-        nonlocal selected
+    @kb.add("d", filter=normal)
+    def _start_delete(event) -> None:
+        nonlocal confirming
         if members:
-            members.pop(selected)
-            if selected >= len(members) and members:
-                selected = len(members) - 1
+            confirming = True
             event.app.invalidate()
 
-    @kb.add("enter")
-    def _save(event) -> None:
-        if len(members) >= 2:
-            event.app.exit(_MemberAction("save", members=tuple(members)))
-        # Otherwise the ⚠ warning is already visible; do nothing.
-
-    @kb.add("escape")
+    @kb.add("escape", filter=normal)
     def _cancel(event) -> None:
         event.app.exit(_MemberAction("cancel"))
 
-    app = Application(
+    @kb.add("y", filter=deleting)
+    def _confirm_delete(event) -> None:
+        nonlocal confirming, selected
+        confirming = False
+        members.pop(selected)
+        if selected >= len(members) and members:
+            selected = len(members) - 1
+        event.app.invalidate()
+
+    @kb.add("<any>", filter=deleting)
+    def _cancel_delete(event) -> None:
+        nonlocal confirming
+        confirming = False
+        event.app.invalidate()
+
+    @kb.add("enter", filter=normal)
+    def _save(event) -> None:
+        if members:
+            event.app.exit(_MemberAction("save", members=tuple(members)))
+
+    app: Application = Application(
         layout=Layout(root),
         key_bindings=kb,
         style=_STYLE,
@@ -485,20 +451,12 @@ def _member_editor_tui(
     return app.run()
 
 
-# ── Composite flows ─────────────────────────────────────────────────
-
-
 def _edit_members_flow(
     pool_name: str,
     members: list[PoolMember],
     upstream_models: list[Model],
 ) -> tuple[PoolMember, ...] | None:
-    """Member-editor loop.
-
-    Alternates between the full-screen member TUI and modal prompts
-    (model picker for adds, line prompts for RPM/TPM).  Returns the
-    final member tuple, or *None* if the user cancelled.
-    """
+    """Member-editor loop; returns the final members or *None* if cancelled."""
     while True:
         result = _member_editor_tui(pool_name, members)
 
@@ -508,7 +466,6 @@ def _edit_members_flow(
             return result.members
 
         if result.kind == "add":
-            # Re-use the main model picker for model selection.
             from .tui import run_picker
 
             pick = run_picker(
@@ -524,11 +481,10 @@ def _edit_members_flow(
                 _clear()
                 print(f"\n  Adding: {pick.model.id}\n")
                 rpm = _prompt_int("Requests per minute (RPM)", optional=True)
-                tpm = _prompt_int("Tokens per minute (TPM)", optional=True)
                 priority = _prompt_int(
                     "Priority / Order (0=highest, blank=auto)", optional=True, minimum=0
                 )
-                members.append(PoolMember(pick.model.id, rpm, tpm, priority))
+                members.append(PoolMember(pick.model.id, rpm=rpm, priority=priority))
             continue
 
         if result.kind == "edit":
@@ -536,18 +492,32 @@ def _edit_members_flow(
             _clear()
             print(f"\n  Editing: {current.model}\n")
             rpm = _prompt_int("Requests per minute (RPM)", current.rpm, optional=True)
-            tpm = _prompt_int("Tokens per minute (TPM)", current.tpm, optional=True)
             priority = _prompt_int(
                 "Priority / Order (0=highest, blank=auto)", current.priority,
                 optional=True, minimum=0,
             )
-            # Keep all unsupported-by-this-screen fields. Reconstructing this
-            # dataclass positionally used to erase an existing limit/cooldown.
-            members[result.index] = replace(current, rpm=rpm, tpm=tpm, priority=priority)
+            members[result.index] = replace(current, rpm=rpm, priority=priority)
             continue
 
 
-# ── Public entry point ──────────────────────────────────────────────
+def _save_pools_or_recover(pools: list[ModelPool]) -> bool:
+    """Save, or recover a lost-update conflict without discarding the session."""
+    while True:
+        try:
+            save_pools(pools)
+            return True
+        except RuntimeError as error:
+            if "changed on disk" not in str(error) and "unreadable" not in str(error):
+                raise
+            _clear()
+            print(f"\n  {error}\n")
+            choice = input("  [o] Overwrite disk copy  [c] Cancel: ").strip().lower()
+            if choice in {"o", "overwrite"}:
+                adopt_current_pools_digest()
+                continue
+            save_pools(pools, POOLS_FILE.with_name("pools.conflict.json"))
+            print("  Your edits were written to pools.conflict.json.")
+            return False
 
 
 def run_pool_manager(upstream_models: list[Model]) -> bool:
@@ -581,8 +551,7 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
             if members is None:
                 continue
             pools.append(ModelPool(name=name, members=members, strategy=strategy))
-            save_pools(pools)
-            changed = True
+            changed = _save_pools_or_recover(pools) or changed
 
         elif result.kind == "edit" and pools:
             pool = pools[result.index]
@@ -610,8 +579,7 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 name=new_name, members=members, enabled=pool.enabled,
                 strategy=strategy,
             )
-            save_pools(pools)
-            changed = True
+            changed = _save_pools_or_recover(pools) or changed
 
         elif result.kind == "toggle" and pools:
             pool = pools[result.index]
@@ -621,10 +589,8 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 enabled=not pool.enabled,
                 strategy=pool.strategy,
             )
-            save_pools(pools)
-            changed = True
+            changed = _save_pools_or_recover(pools) or changed
 
         elif result.kind == "delete" and pools:
             pools.pop(result.index)
-            save_pools(pools)
-            changed = True
+            changed = _save_pools_or_recover(pools) or changed

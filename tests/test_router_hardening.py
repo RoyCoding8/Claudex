@@ -4,10 +4,8 @@ import json
 import unittest
 from unittest.mock import patch
 
-from modules.router import _CooldownTable, _Member, _Pool, _RateLimiter, _pick_member, _sse_frame_is_error
-from tests.test_router import (
-    _DELTA, _OK_BODY, _SSE, _START, _UpstreamHandler, _post, _running_router,
-)
+from modules.router import _CooldownTable, _Member, _pick_member, _Pool, _RateLimiter, _sse_frame_is_error
+from tests.test_router import _DELTA, _OK_BODY, _SSE, _START, _post, _running_router
 
 
 class RouterHardeningTests(unittest.TestCase):
@@ -20,7 +18,7 @@ class RouterHardeningTests(unittest.TestCase):
             status, received = _post(router)
         self.assertEqual(status, 200)
         self.assertEqual(received, body)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first"])
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
 
     def test_whole_body_in_one_flush_is_not_a_stream_error(self) -> None:
         body = b'event: message_start\ndata: {"type":"message_start"}\n\nevent: content_block_delta\ndata: {"text":"event: error"}\n\n'
@@ -42,7 +40,7 @@ class RouterHardeningTests(unittest.TestCase):
             status, payload = _post(router)
         self.assertEqual(status, 503)
         self.assertEqual(len(json.loads(payload)["error"]["attempts"]), 2)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_pool_larger_than_old_cap_tries_every_member(self) -> None:
         members = [{"model": f"provider/{index}", "priority": index} for index in range(10)]
@@ -51,7 +49,7 @@ class RouterHardeningTests(unittest.TestCase):
             status, payload = _post(router)
         self.assertEqual(status, 503)
         self.assertEqual(len(json.loads(payload)["error"]["attempts"]), 10)
-        self.assertEqual(_UpstreamHandler.models, [member["model"] for member in members])
+        self.assertEqual(router.upstream_state.models, [member["model"] for member in members])
 
     def test_non_streaming_response_has_content_length(self) -> None:
         with _running_router((200, {}, _OK_BODY)) as router:
@@ -73,12 +71,10 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(_pick_member(pool, cooldowns, set(), _RateLimiter()).model, "first")
 
     def test_later_stream_error_is_forwarded_and_logged(self) -> None:
-        # Post-commit the bytes are already gone; all the router can do is
-        # forward, log, and park the member so the next request avoids it.
         head = _START + _DELTA
         error = b'event: error\ndata: {"type":"error","error":{"message":"late"}}\n\n'
         with _running_router((200, _SSE, (head, error))) as router:
-            _UpstreamHandler.stream_gate.set()
+            router.upstream_state.stream_gate.set()
             with self.assertLogs("cx.router", level="WARNING") as logs:
                 status, received = _post(router)
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
@@ -92,7 +88,7 @@ class RouterHardeningTests(unittest.TestCase):
             status, received = _post(router)
         self.assertEqual(status, 200)
         self.assertNotIn(b"early", received)
-        self.assertEqual(_UpstreamHandler.models, ["provider/first", "provider/second"])
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
     def test_peek_socket_reset_returns_sanitized_json_error(self) -> None:
         with _running_router((0, {}, b"")) as router:
@@ -101,11 +97,9 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(json.loads(received)["error"]["type"], "pool_exhausted")
 
     def test_midstream_upstream_drop_emits_final_error_event(self) -> None:
-        # A drop after the commit point is unrecoverable: the client keeps the
-        # partial answer plus a terminal error event, and the member is parked.
         head = _START + _DELTA
         with _running_router((200, {**_SSE, "Content-Length": "999"}, (head, b"__drop__"))) as router:
-            _UpstreamHandler.stream_gate.set()
+            router.upstream_state.stream_gate.set()
             status, received = _post(router)
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
         self.assertEqual(status, 200)

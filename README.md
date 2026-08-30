@@ -50,13 +50,35 @@ Press **F7** in the model picker to create cross-provider pools:
 
 1. Name the pool the way you want Claude Code to see it, e.g. `Opus-level`.
 2. Add ≥ 2 provider-specific model IDs (`nvidia_nim/z-ai/glm-5.2`, `vercel/zai/glm-5.2`, …).
-3. Set the real RPM/TPM limit per member. If unsure, leave blank (auto).
+3. Optionally set an RPM per member. If unsure, leave blank (auto).
 4. Optionally set a priority per member (lower number = tried first).
 5. Pick a routing strategy: `fill-first` (default), `round-robin`, `weighted`, or `least-busy`.
 6. Save and return to the picker.
 
 Pool definitions live in `data/pools.json`. The router reloads them automatically on every request
-via `mtime`, so edits take effect without restarting anything.
+via `mtime`, so edits take effect without restarting anything. A full example of the schema:
+
+```json
+{
+  "version": 1,
+  "pools": [
+    {
+      "name": "heavy-duty",
+      "enabled": true,
+      "strategy": "fill-first",
+      "members": [
+        {"model": "provider/first-model", "rpm": 40, "priority": 0, "limit": 40, "cooldown": 30.0},
+        {"model": "provider/second-model", "rpm": 10, "priority": 1}
+      ]
+    }
+  ]
+}
+```
+
+`rpm` is a *weight* for selection inside a tier **and** — on its own — a hard 60-second dispatch
+cap: a member with `rpm: 5` will be sent at most 5 requests per trailing 60 s window even if every
+other member is busy. Set `limit` explicitly if you want a cap that differs from the weight, and
+`cooldown` (seconds) to override the default cool-off after a failed attempt.
 
 Selecting a pool in the picker tells Claude Code to send its `model` field as the pool name (e.g.
 `Opus-level`). The router rewrites that name to a real backend model per request.
@@ -78,11 +100,11 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 - **Selection**. Availability is filtered first, in every strategy: ready/unpaced members are preferred, then paced-out members, then cooling members. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. Within the surviving candidates the strategy decides:
   - `fill-first` (default) — only members at the lowest priority number are considered, chosen weighted-random by `rpm`. Drains a tier before touching the next.
-  - `round-robin` — cycles evenly through the members in config order; priority tiers and `rpm` weights are ignored. The rotation cursor tracks member *identity* and advances once per request, parking just past whichever member was actually dispatched: a member that served a retry is not handed the next request as well, and a member skipped while cooling reclaims its own slot once it recovers.
+  - `round-robin` — cycles evenly through the members in config order; priority tiers and `rpm` weights are ignored. The rotation cursor tracks member *identity* and advances exactly once per request, under one atomic lock, parking just past the member the request started with: concurrent requests can never collide on the same starting member, a member skipped while cooling reclaims its own slot once it recovers, and a failover chain does not fling the cursor forward.
   - `weighted` — draws weighted-random by `rpm` across *every* tier at once, so a low-priority member still gets its share of traffic.
   - `least-busy` — picks among the members holding the fewest live in-flight dispatches, breaking ties weighted-random by `rpm`. Best when members differ in latency rather than quota.
 - **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member is deprioritized so another candidate can serve the request instead of burning a `429`. The sliding window ages out on its own, so the member becomes preferred again when its oldest request falls out of it.
-- **Retry**. Pool failover is protocol-driven, not provider-message-driven. Any non-`2xx` response, network error, or SSE `error` **frame envelope** seen before the commit point cools that backend and tries the next member. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It sweeps every pool member in priority order, and by default sweeps the list twice (`CX_ROUTER_POOL_PASSES`) before giving up — capacity-limited providers reject transiently, so a member that failed one sweep often succeeds on the next. Sweeps stop early at the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`); each attempt's upstream wait is clamped to what remains of that budget.
+- **Retry**. Pool failover is protocol-driven, not provider-message-driven. A `5xx`, a network error, an SSE `error` **frame envelope**, or a transient `4xx` (`408`/`409`/`425`/`429`) seen before the commit point cools that backend and tries the next member. Any other `4xx` (`400`, `404`, `422`, …) is terminal: the request itself is wrong, so the provider's own error is forwarded to the client unchanged and no member is cooled. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It sweeps every pool member in priority order, and by default sweeps the list twice (`CX_ROUTER_POOL_PASSES`) before giving up — capacity-limited providers reject transiently, so a member that failed one sweep often succeeds on the next; a short backoff (1 s, scaling with the sweep number) separates the sweeps so the second pass is not a millisecond replay of the first. Sweeps stop early at the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`); each attempt's upstream wait is clamped to what remains of that budget.
 - **Empty responses**. A `200` carrying no usable content is a failure, not an answer: zero bytes, no complete SSE frame, an unparseable body, `{}`, an empty content array, or a stream that reaches its terminal event without a single content frame. Any of these cools the member (20 s, `CX_ROUTER_COOLDOWN_EMPTY`) and fails over, so a flaky provider returning empties can no longer stall the client. Each format is judged in its own vocabulary (see **Wire formats** below); a tool-call-only turn counts as content in all three. `count_tokens` is exempt from the content check — its success body legitimately has none.
 - **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.
 - **Streaming**. The router holds an SSE response until it proves it carries content — the first content frame in that format's vocabulary — then replays the buffered head and streams the rest incrementally via `HTTPResponse.read1()`. Committing therefore costs only the provider's real time-to-first-token, and the client still receives the stream from its very first frame. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event, logged, and cools the member so the next request avoids it. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
@@ -210,8 +232,13 @@ tests/
 uv run --project . python -m unittest discover tests
 ```
 
-CI runs the same command on `windows-latest` against Python 3.11, 3.12, and 3.13
-(`.github/workflows/tests.yml`) for every push to `main` and every pull request. The suite is
+The project pins `python >=3.11,<3.14`: `python-dotenv` and prompt-toolkit are exercised on that
+range, and a bare system interpreter may lack them. Use the `uv run` form above (or the project
+`.venv`), not whichever `python` is first on PATH.
+
+CI runs the same command — plus `ruff check` and `mypy modules` — on `windows-latest` against
+Python 3.11, 3.12, and 3.13 (`.github/workflows/tests.yml`) for every push to `main` and every
+pull request. The suite is
 hermetic — it stands up loopback servers on ephemeral ports and never touches CLIProxyAPI or a
 provider.
 

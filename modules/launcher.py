@@ -45,6 +45,7 @@ def launch_claude(
     gpt_fast_model: str | None = None,
     gpt_medium_model: str | None = None,
     gpt_subagent_model: str | None = None,
+    openai_family: bool = False,
 ) -> int:
     claude = shutil.which("claude")
     if not claude:
@@ -59,47 +60,48 @@ def launch_claude(
     if auto_compact is False:
         environment["DISABLE_AUTO_COMPACT"] = "1"
         environment["DISABLE_COMPACT"] = "1"
-    else:
-        # Force standard autocompact behavior for custom models by explicitly setting the window
+    elif auto_compact is True:
         window = int(context_tokens * 0.85) if context_tokens else DEFAULT_COMPACT_WINDOW
         environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
-    environment["ANTHROPIC_BASE_URL"] = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
-    environment["ANTHROPIC_AUTH_TOKEN"] = ROUTER_API_KEY
+
+    defaults = ((DEFAULT_GPT_FAST_MODEL, DEFAULT_GPT_MEDIUM_MODEL, DEFAULT_GPT_SUBAGENT_MODEL)
+                if openai_family else (model_id,) * 3)
+    fast, medium, subagent = (chosen or default or model_id
+                              for chosen, default in zip(
+                                  (gpt_fast_model, gpt_medium_model, gpt_subagent_model), defaults, strict=True))
+    environment.update({
+        "ANTHROPIC_BASE_URL": f"http://{ROUTER_HOST}:{ROUTER_PORT}",
+        "ANTHROPIC_AUTH_TOKEN": ROUTER_API_KEY,
+        "ANTHROPIC_MODEL": model_id,
+        "ANTHROPIC_SMALL_FAST_MODEL": fast,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": fast,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": medium,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
+        "CLAUDE_CODE_SUBAGENT_MODEL": subagent,
+        "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    })
     environment.pop("ANTHROPIC_API_KEY", None)
     environment.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
-    environment["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
-    environment["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    environment["ANTHROPIC_MODEL"] = model_id
-    
-    if "gpt" in model_id.lower() or "openai" in model_id.lower():
-        fast = gpt_fast_model or DEFAULT_GPT_FAST_MODEL or model_id
-        medium = gpt_medium_model or DEFAULT_GPT_MEDIUM_MODEL or model_id
-        subagent = gpt_subagent_model or DEFAULT_GPT_SUBAGENT_MODEL or model_id
-        environment["ANTHROPIC_SMALL_FAST_MODEL"] = fast
-        environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = fast
-        environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = medium
-        environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model_id
-        environment["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
-    else:
-        fast = gpt_fast_model or model_id
-        medium = gpt_medium_model or model_id
-        subagent = gpt_subagent_model or model_id
-        environment["ANTHROPIC_SMALL_FAST_MODEL"] = fast
-        environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = fast
-        environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = medium
-        environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model_id
-        environment["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
 
     command = [claude, "--model", model_id]
     if skip_permissions:
         command.append("--dangerously-skip-permissions")
     command.extend(_clean_extra_args(extra_arguments))
 
-    if Path(claude).suffix.lower() in {".cmd", ".bat"}:
-        command_line = subprocess.list2cmdline(command)
-        return subprocess.call(
-            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command_line],
-            env=environment,
-        )
-
-    return subprocess.call(command, env=environment)
+    suffix = Path(claude).suffix.lower()
+    try:
+        if suffix in {".cmd", ".bat"}:
+            command_line = subprocess.list2cmdline(command)
+            return subprocess.call(
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command_line],
+                env=environment,
+            )
+        if suffix == ".ps1":
+            return subprocess.call(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", claude, *command[1:]],
+                env=environment,
+            )
+        return subprocess.call(command, env=environment)
+    except OSError as error:
+        raise RuntimeError(f"Failed to launch {claude}: {error}") from error
