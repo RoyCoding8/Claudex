@@ -22,16 +22,27 @@ It boots in ~250ms and requires no build step.
 
 ## Quick start
 
-Install CLIProxyAPI (see its own docs), put `cli-proxy-api.exe` and `config.yaml` beside this
-project's launcher, or point Claudex at their locations with `CX_CLIPROXY_EXE` and
-`CX_CLIPROXY_CONFIG`. Then, from this repo:
+Install CLIProxyAPI (see its own docs), put its binary (`cli-proxy-api.exe` on Windows,
+`cli-proxy-api` elsewhere) and `config.yaml` beside this project's launcher, or point Claudex at
+their locations with `CX_CLIPROXY_EXE` and `CX_CLIPROXY_CONFIG`. Then, from this repo:
 
 ```bat
 cx.bat
 ```
 
+on Windows, or on Linux and macOS:
+
+```sh
+chmod +x cx.sh   # first time only
+./cx.sh
+```
+
+Both wrappers take the same arguments and pass anything they don't consume through to Claude Code.
+`cx.sh` resolves symlinks, so you can link it onto your `PATH`
+(`ln -s "$PWD/cx.sh" ~/.local/bin/cx`) and run `cx` from any directory.
+
 The first run uses [`uv`](https://github.com/astral-sh/uv) to install `prompt-toolkit` and
-`python-dotenv` into a local `.venv/`. Subsequent runs are instant. `cx.bat`:
+`python-dotenv` into a local `.venv/`. Subsequent runs are instant. The launcher:
 
 1. Starts CLIProxyAPI if it isn't already running.
 2. Starts the cx router if it isn't already running.
@@ -198,6 +209,7 @@ CLIProxyAPI:
 ```
 cx.py                       # entry point: orchestrates proxy + router + picker
 cx.bat                      # Windows launcher (uv sync + cx.py)
+cx.sh                       # Linux/macOS launcher (uv sync + cx.py)
 .env.example                # env var template (tracked); copy to .env (ignored)
 modules/
   proxy.py                  # CLIProxyAPI lifecycle
@@ -228,7 +240,7 @@ tests/
 
 ## Running the tests
 
-```bat
+```sh
 uv run --project . python -m unittest discover tests
 ```
 
@@ -236,16 +248,16 @@ The project pins `python >=3.11,<3.14`: `python-dotenv` and prompt-toolkit are e
 range, and a bare system interpreter may lack them. Use the `uv run` form above (or the project
 `.venv`), not whichever `python` is first on PATH.
 
-CI runs the same command — plus `ruff check` and `mypy modules` — on `windows-latest` against
-Python 3.11, 3.12, and 3.13 (`.github/workflows/tests.yml`) for every push to `main` and every
-pull request. The suite is
+CI runs the same command — plus `ruff check` and `mypy modules` — on `windows-latest` and
+`ubuntu-latest` against Python 3.11, 3.12, and 3.13 (`.github/workflows/tests.yml`) for every push
+to `main` and every pull request. The suite is
 hermetic — it stands up loopback servers on ephemeral ports and never touches CLIProxyAPI or a
 provider.
 
 ## Multi-session support
 
 The router is a long-lived subprocess (PID in `data/router.pid`, log in `data/router.log`). A
-second `cx.bat` in another terminal detects the running router and reuses it. Only one CLIProxyAPI
+second launcher in another terminal detects the running router and reuses it. Only one CLIProxyAPI
 process and one router process are ever needed regardless of how many Claude Code sessions you
 have open.
 

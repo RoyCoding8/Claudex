@@ -65,7 +65,7 @@ def _env_float(name: str, *aliases: str, default: float, minimum: float = 0.0,
 
 CONFIG_ERRORS: list[str] = []
 
-PROXY_EXE = _env_path("CX_CLIPROXY_EXE", ROOT / "cli-proxy-api.exe")
+PROXY_EXE = _env_path("CX_CLIPROXY_EXE", ROOT / ("cli-proxy-api.exe" if os.name == "nt" else "cli-proxy-api"))
 PROXY_CONFIG = _env_path("CX_CLIPROXY_CONFIG", ROOT / "config.yaml")
 PROXY_LOG, PROXY_PID = DATA_DIR / "cli-proxy-api.log", DATA_DIR / "cli-proxy-api.pid"
 PROXY_HOST, PROXY_PORT = _env("CX_CLIPROXY_HOST", default="127.0.0.1"), _env_int("CX_CLIPROXY_PORT", default=8317, minimum=1, maximum=65535)
