@@ -373,6 +373,99 @@ class ResponseCapTests(unittest.TestCase):
         self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
 
+class DirectPathTests(unittest.TestCase):
+    def test_direct_empty_stream_is_retried_then_rejected(self):
+        from tests.test_router import _START, _STOP
+        empty = (200, _SSE, _START + _STOP)
+        with patch("modules.router._DIRECT_BACKOFF", 0.0):
+            with _running_router(empty, empty, empty) as router:
+                status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 502)
+        self.assertIn("interrupted", body.decode())
+        self.assertEqual(json.loads(body)["error"]["type"], "empty")
+        self.assertEqual(router.upstream_state.models, ["provider/direct"] * 3)
+
+    def test_direct_empty_body_is_retried_then_rejected(self):
+        empty = (200, {}, b'{"type":"message","content":[]}')
+        with patch("modules.router._DIRECT_BACKOFF", 0.0):
+            with _running_router(empty, empty, empty) as router:
+                status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 502)
+        self.assertEqual(len(json.loads(body)["error"]["attempts"]), 3)
+
+    def test_direct_empty_body_recovers_on_retry(self):
+        """The safeguard's point: an empty 200 becomes a good answer, not an error."""
+        with patch("modules.router._DIRECT_BACKOFF", 0.0):
+            with _running_router(
+                (200, {}, b'{"type":"message","content":[]}'),
+                (200, {}, _OK_BODY),
+            ) as router:
+                status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), json.loads(_OK_BODY))
+        self.assertEqual(router.upstream_state.models, ["provider/direct"] * 2)
+
+    def test_direct_empty_stream_recovers_on_retry(self):
+        from tests.test_router import _DELTA, _START, _STOP
+        good = _START + _DELTA + _STOP
+        with patch("modules.router._DIRECT_BACKOFF", 0.0):
+            with _running_router(
+                (200, _SSE, _START + _STOP),
+                (200, _SSE, good),
+            ) as router:
+                status, received = _post(router, model="provider/direct")
+        self.assertEqual((status, received), (200, good))
+
+    def test_direct_stream_error_frame_is_retried(self):
+        from tests.test_router import _DELTA, _START, _STOP
+        error_frame = b'event: error\ndata: {"type":"error","error":{"message":"boom"}}\n\n'
+        good = _START + _DELTA + _STOP
+        with patch("modules.router._DIRECT_BACKOFF", 0.0):
+            with _running_router(
+                (200, _SSE, _START + error_frame),
+                (200, _SSE, good),
+            ) as router:
+                status, received = _post(router, model="provider/direct")
+        self.assertEqual((status, received), (200, good))
+
+    def test_direct_attempt_budget_is_respected(self):
+        empty = (200, {}, b"")
+        with patch("modules.router._DIRECT_BACKOFF", 0.0), patch("modules.router._DIRECT_ATTEMPTS", 2):
+            with _running_router(empty, empty, empty) as router:
+                status, _ = _post(router, model="provider/direct")
+        self.assertEqual(status, 502)
+        self.assertEqual(router.upstream_state.models, ["provider/direct"] * 2)
+
+    def test_direct_valid_stream_passes_through(self):
+        from tests.test_router import _DELTA, _START, _STOP
+        body = _START + _DELTA + _STOP
+        with _running_router((200, _SSE, body)) as router:
+            status, received = _post(router, model="provider/direct")
+        self.assertEqual((status, received), (200, body))
+        self.assertEqual(router.upstream_state.models, ["provider/direct"])
+
+    def test_direct_400_still_forwarded(self):
+        with _running_router((400, {}, b'{"error":{"message":"bad"}}')) as router:
+            status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 400)
+        self.assertIn(b"bad", body)
+
+    def test_direct_500_is_forwarded_not_retried(self):
+        """A status the provider chose keeps its body, headers, and single attempt."""
+        with _running_router((500, {}, b'{"error":{"message":"provider down"}}')) as router:
+            status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 500)
+        self.assertIn(b"provider down", body)
+        self.assertEqual(router.upstream_state.models, ["provider/direct"])
+
+    def test_direct_429_retry_after_reaches_client(self):
+        with _running_router((429, {"Retry-After": "7"}, b'{"error":{"message":"slow"}}')) as router:
+            status, body = _post(router, model="provider/direct")
+        self.assertEqual(status, 429)
+        self.assertIn(b"slow", body)
+        self.assertEqual(router.upstream_state.models, ["provider/direct"])
+
+
 class StopRouterTests(unittest.TestCase):
     def test_stop_router_without_pid_file(self):
         from modules import router_starter

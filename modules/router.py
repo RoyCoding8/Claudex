@@ -38,6 +38,7 @@ from .config import (
     ROUTER_COOLDOWN_EMPTY,
     ROUTER_COOLDOWN_NETWORK,
     ROUTER_COOLDOWN_PACED_429,
+    ROUTER_DIRECT_ATTEMPTS,
     ROUTER_HOST,
     ROUTER_LOG,
     ROUTER_POOL_PASSES,
@@ -51,6 +52,7 @@ _UPSTREAM_TIMEOUT = 600.0
 _UPSTREAM_HEADER_TIMEOUT = 60.0
 _POOL_REQUEST_TIMEOUT = ROUTER_POOL_TIMEOUT
 _POOL_PASSES = ROUTER_POOL_PASSES
+_DIRECT_ATTEMPTS = ROUTER_DIRECT_ATTEMPTS
 _MODELS_CACHE_TTL = 30.0
 _POOLS_STAT_INTERVAL = 0.25
 _ERROR_PEEK_BYTES = 16 * 1024
@@ -58,6 +60,7 @@ _HEAD_PEEK_BYTES = 256 * 1024
 _MAX_BODY_BYTES = 128 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _SWEEP_BACKOFF = 1.0
+_DIRECT_BACKOFF = 0.5
 _HANDLER_TIMEOUT = 30
 _now = time.monotonic
 _COOLDOWN_ON_429_DEFAULT = ROUTER_COOLDOWN_429
@@ -69,6 +72,11 @@ _COOLDOWN_ON_EMPTY = ROUTER_COOLDOWN_EMPTY
 _AUTH_STATUS = frozenset({401, 403})
 _POOLED_PATHS = frozenset({"/v1/messages", "/v1/messages/count_tokens",
                            "/v1/responses", "/v1/chat/completions"})
+# Verdicts a lone model retries against itself: a 2xx that carried nothing usable.
+# Status-based verdicts (4xx/429/5xx) stay forwarded — they are the provider's own
+# answer, they carry Retry-After and error text the client needs, and Claude Code
+# already retries them. An unusable 200 is the case nothing else recovers from.
+_INTEGRITY_FAILURES = frozenset({"empty", "malformed", "truncated", "oversized", "stream_error"})
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
@@ -647,13 +655,57 @@ class _RouterHandler(BaseHTTPRequestHandler):
             self._forward_once(path, dict(self.headers), body)
 
     def _forward_once(self, path: str, headers: dict[str, str], body: bytes) -> None:
+        """One model, the pool's integrity safeguards — retried against itself.
+
+        A pool answers an unusable 200 by failing over to another member. A lone model
+        has nowhere to fail over to, so the equivalent recovery is another attempt at
+        the same backend: nothing was forwarded to the client yet, so the retry is safe
+        and invisible. Only content-integrity verdicts are retried; a status the
+        provider chose to send is still forwarded unchanged.
+        """
+        pooled = path in _POOLED_PATHS
+        attempts = _DIRECT_ATTEMPTS if pooled else 1
+        request_id = uuid.uuid4().hex[:12]
         deadline = _now() + _POOL_REQUEST_TIMEOUT
-        try:
-            upstream = _forward_to_upstream("POST", path, _upstream_headers(headers, body), body, deadline)
-        except (OSError, HTTPException) as error:
-            self._send_json(502, {"error": {"message": f"router: upstream unreachable: {error}"}})
-            return
-        self._stream_upstream(upstream, deadline=deadline)
+        failures: list[dict[str, Any]] = []
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                if self._client_disconnected():
+                    _LOG.info("request=%s client disconnected during direct retry", request_id)
+                    return
+                remaining = deadline - _now()
+                if remaining <= 0:
+                    break
+                if pause := min(_DIRECT_BACKOFF * (attempt - 1), remaining):
+                    time.sleep(pause)
+                _LOG.info("request=%s direct retry attempt=%d path=%s", request_id, attempt, path)
+            upstream = None
+            try:
+                upstream = _forward_to_upstream(
+                    "POST", path, _upstream_headers(headers, body), body, deadline)
+            except (OSError, HTTPException) as error:
+                failures.append({"category": "network", "status": None})
+                _LOG.warning("request=%s direct attempt=%d path=%s category=network error=%s",
+                             request_id, attempt, path, error)
+                continue
+            verdict = _classify_retry(upstream, path=path, deadline=deadline) if pooled else None
+            if verdict is None or verdict[0] not in _INTEGRITY_FAILURES:
+                self._stream_upstream(upstream, request_id=request_id, deadline=deadline)
+                return
+            prefix = _read_error_prefix(upstream)
+            upstream.close()
+            failures.append({"category": verdict[0], "status": upstream.status})
+            _LOG.warning("request=%s direct attempt=%d path=%s status=%d category=%s upstream=%r",
+                         request_id, attempt, path, upstream.status, verdict[0], prefix)
+        category = failures[-1]["category"] if failures else "network"
+        _LOG.warning("request=%s direct path=%s exhausted attempts=%d category=%s",
+                     request_id, path, len(failures), category)
+        message = ("router: upstream unreachable" if category == "network"
+                   else "router: upstream response interrupted")
+        self._send_json(502, {"error": {
+            "message": message, "type": category,
+            "request_id": request_id, "attempts": failures,
+        }})
 
     def _read_body(self) -> bytes | None:
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":

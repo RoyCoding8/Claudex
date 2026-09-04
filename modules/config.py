@@ -85,6 +85,7 @@ ROUTER_COOLDOWN_PACED_429 = _env_float("CX_ROUTER_COOLDOWN_PACED_429", default=1
 ROUTER_COOLDOWN_EMPTY = _env_float("CX_ROUTER_COOLDOWN_EMPTY", default=20.0, minimum=1.0, maximum=1800.0)
 ROUTER_POOL_TIMEOUT = _env_float("CX_ROUTER_POOL_TIMEOUT", default=180.0, minimum=1.0, maximum=1800.0)
 ROUTER_POOL_PASSES = _env_int("CX_ROUTER_POOL_PASSES", default=2, minimum=1, maximum=10)
+ROUTER_DIRECT_ATTEMPTS = _env_int("CX_ROUTER_DIRECT_ATTEMPTS", default=3, minimum=1, maximum=10)
 
 DEFAULT_GPT_FAST_MODEL = _env("CX_GPT_FAST_MODEL", default="")
 DEFAULT_GPT_MEDIUM_MODEL = _env("CX_GPT_MEDIUM_MODEL", default="")
