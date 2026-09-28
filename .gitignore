@@ -14,14 +14,22 @@ __pycache__/
 .env.*
 !.env.example
 
+# Locally installed CLIProxyAPI binaries and its config
+/cli-proxy-api
+/cli-proxy-api.exe
+/config.yaml
+
 # Local configuration and runtime state.
 data/pools.json
 data/settings.json
 data/*.broken_*.json
 data/*.log
+data/*.log.*
+data/pools.conflict*.json
 data/*.pid
 data/*.err
 data/*.tmp
+data/*.staging
 data/*.lock
 tmp/
 
@@ -38,3 +46,5 @@ Thumbs.db
 # Local backup files
 *.bak
 *.bak-*
+
+.worktrees/

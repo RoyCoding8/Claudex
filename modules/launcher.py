@@ -14,6 +14,7 @@ from .config import (
     ROUTER_HOST,
     ROUTER_PORT,
 )
+from .urls import http_url
 
 
 def _clean_extra_args(arguments: list[str]) -> list[str]:
@@ -36,6 +37,17 @@ def _clean_extra_args(arguments: list[str]) -> list[str]:
     return cleaned
 
 
+def _no_proxy_value(environment: dict[str, str], host: str) -> str:
+    entries = [
+        entry.strip()
+        for variable in ("NO_PROXY", "no_proxy")
+        for entry in environment.get(variable, "").split(",")
+        if entry.strip()
+    ]
+    entries.append(host)
+    return ",".join(dict.fromkeys(entries))
+
+
 def launch_claude(
     model_id: str,
     skip_permissions: bool,
@@ -49,11 +61,16 @@ def launch_claude(
 ) -> int:
     claude = shutil.which("claude")
     if not claude:
-        raise RuntimeError(
-            "The claude command was not found. Install Claude Code or add it to PATH."
-        )
+        raise RuntimeError("The claude command was not found. Install Claude Code or add it to PATH.")
 
     environment = os.environ.copy()
+    for variable in (
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        "DISABLE_AUTO_COMPACT",
+        "DISABLE_COMPACT",
+    ):
+        environment.pop(variable, None)
     if context_tokens:
         environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_tokens)
 
@@ -69,8 +86,9 @@ def launch_claude(
     fast, medium, subagent = (chosen or default or model_id
                               for chosen, default in zip(
                                   (gpt_fast_model, gpt_medium_model, gpt_subagent_model), defaults, strict=True))
+    no_proxy = _no_proxy_value(environment, ROUTER_HOST)
     environment.update({
-        "ANTHROPIC_BASE_URL": f"http://{ROUTER_HOST}:{ROUTER_PORT}",
+        "ANTHROPIC_BASE_URL": http_url(ROUTER_HOST, ROUTER_PORT),
         "ANTHROPIC_AUTH_TOKEN": ROUTER_API_KEY,
         "ANTHROPIC_MODEL": model_id,
         "ANTHROPIC_SMALL_FAST_MODEL": fast,
@@ -80,9 +98,22 @@ def launch_claude(
         "CLAUDE_CODE_SUBAGENT_MODEL": subagent,
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        "NO_PROXY": no_proxy,
+        "no_proxy": no_proxy,
     })
     environment.pop("ANTHROPIC_API_KEY", None)
     environment.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    for variable in tuple(environment):
+        if variable.upper().startswith("CX_"):
+            environment.pop(variable)
+    for variable in (
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_VERTEX",
+    ):
+        environment.pop(variable, None)
 
     command = [claude, "--model", model_id]
     if skip_permissions:
@@ -91,12 +122,6 @@ def launch_claude(
 
     suffix = Path(claude).suffix.lower()
     try:
-        if suffix in {".cmd", ".bat"}:
-            command_line = subprocess.list2cmdline(command)
-            return subprocess.call(
-                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command_line],
-                env=environment,
-            )
         if suffix == ".ps1":
             return subprocess.call(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", claude, *command[1:]],

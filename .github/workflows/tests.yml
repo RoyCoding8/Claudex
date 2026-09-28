@@ -27,4 +27,6 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check modules cx.py tests
       - run: uv run mypy modules
-      - run: uv run python -m unittest discover tests
+      - run: uv run mypy --platform win32 modules
+      - run: uv run mypy --platform darwin modules
+      - run: uv run python -m unittest discover -s tests -t .

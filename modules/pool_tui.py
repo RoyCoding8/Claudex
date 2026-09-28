@@ -13,15 +13,39 @@ from prompt_toolkit.styles import Style
 
 from .models import Model
 from .pools import (
+    _MAX_INTEGER,
     POOLS_FILE,
     STRATEGIES,
     ModelPool,
     PoolMember,
+    PoolSaveConflictError,
+    PoolSaveRecoveryError,
+    PoolSaveUnreadableError,
+    _release_conflict_path,
     adopt_current_pools_digest,
+    conflict_artifact_carries_edits,
+    conflict_artifact_holds,
     ensure_default_pools_file,
     load_pools,
+    reservation_digest,
+    reserve_pools_conflict_path,
     save_pools,
 )
+
+_MAX_CONFLICT_RECOVERY_ATTEMPTS = 8
+
+
+class _Cancelled:
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Answered:
+    value: int | None
+
+
+_OptionalInt = _Answered | _Cancelled
+
 
 _STYLE = Style.from_dict(
     {
@@ -64,22 +88,16 @@ def _prompt_int(
     label: str,
     default: int | None = None,
     *,
-    optional: bool = False,
     minimum: int = 1,
-) -> int | None:
+) -> _OptionalInt:
     suffix = f" [{default}]" if default is not None else ""
-    opt = " (Enter to skip)" if optional else ""
     while True:
         try:
-            raw = input(f"  {label}{opt}{suffix}: ").strip()
+            raw = input(f"  {label} (Enter to skip){suffix}: ").strip()
         except (KeyboardInterrupt, EOFError):
-            return None
+            return _Cancelled()
         if not raw:
-            if default is not None:
-                return default
-            if optional:
-                return None
-            continue
+            return _Answered(default)
         try:
             number = int(raw)
         except ValueError:
@@ -88,7 +106,10 @@ def _prompt_int(
         if number < minimum:
             print(f"  Must be at least {minimum}.")
             continue
-        return number
+        if number > _MAX_INTEGER:
+            print(f"  Must be at most {_MAX_INTEGER}.")
+            continue
+        return _Answered(number)
 
 
 def _prompt_strategy(default: str = STRATEGIES[0]) -> str | None:
@@ -253,6 +274,8 @@ def _pool_list_tui(pools: list[ModelPool]) -> _PoolAction:
 
     @kb.add("escape", filter=normal)
     @kb.add("q", filter=normal)
+    @kb.add("c-c")
+    @kb.add("c-d")
     def _back(event) -> None:
         event.app.exit(_PoolAction("back"))
 
@@ -416,6 +439,8 @@ def _member_editor_tui(
             event.app.invalidate()
 
     @kb.add("escape", filter=normal)
+    @kb.add("c-c")
+    @kb.add("c-d")
     def _cancel(event) -> None:
         event.app.exit(_MemberAction("cancel"))
 
@@ -476,57 +501,132 @@ def _edit_members_flow(
             if pick.action == "launch" and pick.model:
                 if any(m.model == pick.model.id for m in members):
                     _clear()
-                    input("  That model is already in this pool. Press Enter...")
+                    try:
+                        input("  That model is already in this pool. Press Enter...")
+                    except (KeyboardInterrupt, EOFError):
+                        pass
                     continue
                 _clear()
                 print(f"\n  Adding: {pick.model.id}\n")
-                rpm = _prompt_int("Requests per minute (RPM)", optional=True)
+                rpm = _prompt_int("Requests per minute (RPM)")
+                if isinstance(rpm, _Cancelled):
+                    continue
                 priority = _prompt_int(
-                    "Priority / Order (0=highest, blank=auto)", optional=True, minimum=0
+                    "Priority / Order (0=highest, blank=auto)", minimum=0
                 )
-                members.append(PoolMember(pick.model.id, rpm=rpm, priority=priority))
+                if isinstance(priority, _Cancelled):
+                    continue
+                members.append(
+                    PoolMember(pick.model.id, rpm=rpm.value, priority=priority.value)
+                )
             continue
 
         if result.kind == "edit":
             current = members[result.index]
             _clear()
             print(f"\n  Editing: {current.model}\n")
-            rpm = _prompt_int("Requests per minute (RPM)", current.rpm, optional=True)
+            rpm = _prompt_int("Requests per minute (RPM)", current.rpm)
+            if isinstance(rpm, _Cancelled):
+                continue
             priority = _prompt_int(
-                "Priority / Order (0=highest, blank=auto)", current.priority,
-                optional=True, minimum=0,
+                "Priority / Order (0=highest, blank=auto)",
+                current.priority,
+                minimum=0,
             )
-            members[result.index] = replace(current, rpm=rpm, priority=priority)
+            if isinstance(priority, _Cancelled):
+                continue
+            members[result.index] = replace(
+                current, rpm=rpm.value, priority=priority.value
+            )
             continue
 
 
-def _save_pools_or_recover(pools: list[ModelPool]) -> bool:
-    """Save, or recover a lost-update conflict without discarding the session."""
+def _write_pools_conflict(
+    pools: list[ModelPool], upstream_models: list[Model]
+) -> None:
+    last_error: Exception | None = None
+    for _ in range(_MAX_CONFLICT_RECOVERY_ATTEMPTS):
+        try:
+            conflict_path = reserve_pools_conflict_path(POOLS_FILE)
+        except (KeyboardInterrupt, Exception) as error:
+            raise PoolSaveRecoveryError(
+                pools,
+                "Could not reserve a pool conflict artifact.",
+            ) from error
+        try:
+            published = save_pools(
+                pools,
+                conflict_path,
+                upstream_models=upstream_models,
+            )
+        except PoolSaveConflictError as error:
+            last_error = error
+            _release_conflict_path(conflict_path, reservation_digest())
+            continue
+        except (KeyboardInterrupt, Exception) as error:
+            _release_conflict_path(conflict_path, reservation_digest())
+            if conflict_artifact_carries_edits(conflict_path):
+                print(f"  Your edits were written to {conflict_path.name}.")
+                return
+            raise PoolSaveRecoveryError(
+                pools,
+                "Could not preserve pending pool edits in a conflict artifact.",
+            ) from error
+        _release_conflict_path(conflict_path, published)
+        if not conflict_artifact_holds(conflict_path, published):
+            raise PoolSaveRecoveryError(
+                pools,
+                f"Could not confirm your pending pool edits in {conflict_path.name}.",
+            )
+        print(f"  Your edits were written to {conflict_path.name}.")
+        return
+    raise PoolSaveRecoveryError(
+        pools,
+        f"Could not preserve pending pool edits after {_MAX_CONFLICT_RECOVERY_ATTEMPTS} attempts.",
+    ) from last_error
+
+
+def _save_pools_or_recover(
+    pools: list[ModelPool], upstream_models: list[Model]
+) -> bool:
     while True:
         try:
-            save_pools(pools)
+            save_pools(pools, path=POOLS_FILE, upstream_models=upstream_models)
             return True
-        except RuntimeError as error:
-            if "changed on disk" not in str(error) and "unreadable" not in str(error):
-                raise
+        except (KeyboardInterrupt, EOFError, PoolSaveUnreadableError):
+            _write_pools_conflict(pools, upstream_models)
+            return False
+        except PoolSaveConflictError as error:
             _clear()
             print(f"\n  {error}\n")
-            choice = input("  [o] Overwrite disk copy  [c] Cancel: ").strip().lower()
+            try:
+                choice = input("  [o] Overwrite disk copy  [c] Cancel: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                _write_pools_conflict(pools, upstream_models)
+                return False
             if choice in {"o", "overwrite"}:
-                adopt_current_pools_digest()
+                try:
+                    adopt_current_pools_digest(POOLS_FILE)
+                except (KeyboardInterrupt, EOFError, PoolSaveUnreadableError):
+                    _write_pools_conflict(pools, upstream_models)
+                    return False
                 continue
-            save_pools(pools, POOLS_FILE.with_name("pools.conflict.json"))
-            print("  Your edits were written to pools.conflict.json.")
+            _write_pools_conflict(pools, upstream_models)
             return False
 
 
 def run_pool_manager(upstream_models: list[Model]) -> bool:
     """Interactive pool manager.  Returns *True* when data changed."""
-    ensure_default_pools_file()
+    ensure_default_pools_file(POOLS_FILE)
     changed = False
 
     while True:
-        pools = load_pools(upstream_models=upstream_models)
+        try:
+            pools = load_pools(POOLS_FILE, upstream_models=upstream_models)
+        except RuntimeError as error:
+            print(f"  {error}")
+            print("  Leaving the pool manager so nothing is written over it.")
+            return changed
         result = _pool_list_tui(pools)
 
         if result.kind == "back":
@@ -542,7 +642,10 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 m.id == name for m in upstream_models
             ):
                 _clear()
-                input("  That name already exists. Press Enter...")
+                try:
+                    input("  That name already exists. Press Enter...")
+                except (KeyboardInterrupt, EOFError):
+                    pass
                 continue
             strategy = _prompt_strategy()
             if strategy is None:
@@ -551,7 +654,7 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
             if members is None:
                 continue
             pools.append(ModelPool(name=name, members=members, strategy=strategy))
-            changed = _save_pools_or_recover(pools) or changed
+            changed = _save_pools_or_recover(pools, upstream_models) or changed
 
         elif result.kind == "edit" and pools:
             pool = pools[result.index]
@@ -565,7 +668,10 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 or any(m.id == new_name for m in upstream_models)
             ):
                 _clear()
-                input("  That name already exists. Press Enter...")
+                try:
+                    input("  That name already exists. Press Enter...")
+                except (KeyboardInterrupt, EOFError):
+                    pass
                 continue
             strategy = _prompt_strategy(pool.strategy)
             if strategy is None:
@@ -579,7 +685,7 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 name=new_name, members=members, enabled=pool.enabled,
                 strategy=strategy,
             )
-            changed = _save_pools_or_recover(pools) or changed
+            changed = _save_pools_or_recover(pools, upstream_models) or changed
 
         elif result.kind == "toggle" and pools:
             pool = pools[result.index]
@@ -589,8 +695,8 @@ def run_pool_manager(upstream_models: list[Model]) -> bool:
                 enabled=not pool.enabled,
                 strategy=pool.strategy,
             )
-            changed = _save_pools_or_recover(pools) or changed
+            changed = _save_pools_or_recover(pools, upstream_models) or changed
 
         elif result.kind == "delete" and pools:
             pools.pop(result.index)
-            changed = _save_pools_or_recover(pools) or changed
+            changed = _save_pools_or_recover(pools, upstream_models) or changed

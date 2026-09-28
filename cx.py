@@ -5,25 +5,33 @@ import sys
 import traceback
 import webbrowser
 
-from modules.config import CONFIG_ERRORS
+from modules.config import CONFIG_ERRORS, ConfigError, ConfigSource
 from modules.launcher import launch_claude
 from modules.models import Model, category_for, fetch_models, fetch_upstream_models
-from modules.pool_tui import run_pool_manager
-from modules.pools import load_pools, pool_names, validate_pools_against_models
+from modules.pool_tui import _write_pools_conflict, run_pool_manager
+from modules.pools import PoolSaveRecoveryError, load_pools, pool_names, validate_pools_against_models
 from modules.proxy import ensure_proxy
-from modules.router_starter import ensure_router, read_router_pid, router_is_ready, stop_router
+from modules.router_starter import StopOutcome, ensure_router, read_router_pid, router_is_ready, stop_router
 from modules.tui import run_picker
+from modules.urls import http_url
 
 
 def clear_console() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def pause_on_error(message: str) -> None:
+def _ask(prompt: str) -> str | None:
+    try:
+        return input(prompt)
+    except (EOFError, OSError, RuntimeError):
+        return None
+
+
+def pause_on_error(message: str) -> bool:
     clear_console()
     print("Claudex could not refresh its configuration or model list\n")
     print(message)
-    input("\nPress Enter to retry...")
+    return _ask("\nPress Enter to retry...") is not None
 
 
 def _log_traceback(error: Exception) -> None:
@@ -42,24 +50,22 @@ def _was_interrupted(exit_code: int) -> bool:
 
 def _is_openai_family(model: Model, upstream_models: list[Model],
                       current_pools) -> bool:
-    """Judge the family from provider metadata, never from the user-chosen alias."""
     if model.is_pool:
         members = next((pool.members for pool in current_pools if pool.name == model.id), ())
-        resolved = [upstream for upstream in upstream_models
-                    if upstream.id in {member.model for member in members}]
+        resolved = [upstream for upstream in upstream_models if upstream.id in {member.model for member in members}]
         return bool(resolved) and all(category_for(upstream) == "Codex" for upstream in resolved)
     return category_for(model) == "Codex"
 
 
 def _open_management() -> None:
     from modules.config import PROXY_HOST, PROXY_PORT
-    url = f"http://{PROXY_HOST}:{PROXY_PORT}/management.html"
+    url = http_url(PROXY_HOST, PROXY_PORT, "/management.html")
     opened = webbrowser.open(url)
     clear_console()
     print("CLIProxyAPI management\n\n" + url)
     if not opened:
         print("\nThe browser did not open automatically; use the URL above.")
-    input("\nAfter saving provider changes, press Enter to refresh Claudex...")
+    _ask("\nAfter saving provider changes, press Enter to refresh Claudex...")
 
 
 def _router_console() -> None:
@@ -69,19 +75,28 @@ def _router_console() -> None:
     if running:
         print(f"  Status: running (PID {pid})")
         print("\n  ⚠ Active Claude Code sessions may lose in-flight responses")
-        choice = input("\n  [K] Kill router   [R] Restart router   [Enter] Cancel\n\n  Choice: ").strip().lower()
+        answer = _ask("\n  [K] Kill router   [R] Restart router   [Enter] Cancel\n\n  Choice: ")
+        choice = answer.strip().lower() if answer else ""
         if choice in {"k", "kill"}:
-            if stop_router():
+            outcome = stop_router()
+            if outcome is StopOutcome.STOPPED:
                 print("\n  Router stopped.")
+            elif outcome is StopOutcome.ABSENT:
+                print("\n  Nothing was running.")
             else:
-                print("\n  Router did not stop — check data/router.log.")
-            input("  Press Enter to return...")
+                print("\n  Router did not stop and may still be running — check data/router.log.")
+            _ask("  Press Enter to return...")
         elif choice in {"r", "restart"}:
-            stopped = stop_router()
-            print(f"\n  Router {'stopped' if stopped else 'did not stop'}; restarting...")
+            outcome = stop_router()
+            if outcome is StopOutcome.ABSENT:
+                print("\n  Nothing was running; starting the router…")
+            elif outcome is StopOutcome.REFUSED:
+                print("\n  Router did not stop and may still be running; not restarting it — check data/router.log.")
+            else:
+                print("\n  Router stopped; restarting…")
     else:
         print("  Status: not currently ready\n\n  Router will be rechecked on refresh.")
-        input("  Press Enter to return...")
+        _ask("  Press Enter to return...")
 
 
 def _configure_extra_models(model_list: list[Model]) -> None:
@@ -96,9 +111,43 @@ def _configure_extra_models(model_list: list[Model]) -> None:
             set_extra_model(key, None)
 
 
+def _recover_pool_save(
+    error: PoolSaveRecoveryError, upstream_models: list[Model]
+) -> bool:
+    try:
+        clear_console()
+        print(f"\n{error}\n")
+        print("  Pending pool edits remain in memory.")
+        try:
+            answer = _ask("\nPress Enter to write them to a pool recovery file...")
+            if answer is None:
+                print("  No terminal answered; writing the recovery file now.")
+        except KeyboardInterrupt:
+            pass
+        _write_pools_conflict(list(error.pools), upstream_models)
+    except (KeyboardInterrupt, PoolSaveRecoveryError) as failure:
+        print(f"\n  No pool recovery file was written ({str(failure) or 'interrupted'}).")
+        reason = next(
+            (os.strerror(candidate.errno) for candidate in (failure.__cause__, failure.__context__)
+             if isinstance(candidate, OSError) and candidate.errno),
+            None,
+        )
+        if reason is not None:
+            print(f"  Reason: {reason}")
+        unsaved = ", ".join(pool.name for pool in error.pools) or "none"
+        print(f"  Unsaved pool edits: {unsaved}.")
+        return False
+    return True
+
+
 def main() -> int:
     if CONFIG_ERRORS:
-        print("Configuration problems in .env:")
+        has_file_error = any(
+            isinstance(problem, ConfigError) and problem.source is ConfigSource.FILE
+            for problem in CONFIG_ERRORS
+        )
+        header = "Configuration problems in .env:" if has_file_error else "Configuration problems:"
+        print(header)
         for problem in CONFIG_ERRORS:
             print(f"  - {problem}")
         return 1
@@ -126,7 +175,11 @@ def main() -> int:
             if result.action == "refresh":
                 continue
             if result.action == "pools":
-                run_pool_manager(upstream_models)
+                try:
+                    run_pool_manager(upstream_models)
+                except PoolSaveRecoveryError as error:
+                    if not _recover_pool_save(error, upstream_models):
+                        return 130
                 continue
             if result.action == "management":
                 _open_management()
@@ -152,14 +205,16 @@ def main() -> int:
                 )
                 if exit_code != 0 and not _was_interrupted(exit_code):
                     print(f"\nClaude Code exited with code {exit_code}.")
-                    input("Press Enter to return to Claudex...")
-        except KeyboardInterrupt:
+                    if _ask("Press Enter to return to Claudex...") is None:
+                        return 130
+        except (KeyboardInterrupt, EOFError):
             return 130
         except Exception as error:
             if not isinstance(error, RuntimeError):
                 _log_traceback(error)
                 error = RuntimeError(f"Unexpected {type(error).__name__}: {error}")
-            pause_on_error(str(error))
+            if not pause_on_error(str(error)):
+                return 130
 
 
 if __name__ == "__main__":
