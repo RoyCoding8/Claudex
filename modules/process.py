@@ -27,6 +27,7 @@ MAX_PID = (1 << 32) - 1 if os.name == "nt" else (1 << 31) - 1
 
 _POLL_INTERVAL = 0.2
 _CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", errno.EAGAIN)})
+_ZOMBIES: set[int] = set()
 
 
 def _no_window() -> int:
@@ -58,6 +59,23 @@ def run_tool(command: list[str], *, pid: int, timeout: float, label: str) -> sub
         raise RuntimeError(f"{label} could not be run to check whether pid {pid} is running ({error})") from error
 
 
+def _darwin_state(pid: int) -> str:
+    """The first character of ps's state column for a pid, or "" if there is none.
+
+    POSIX requires kill(pid, 0) to succeed for a zombie, and XNU implements that
+    deliberately, so the liveness probe cannot tell one from a running process.
+    macOS exposes no /proc; the process table is reachable only through ps.
+    """
+    result = run_tool(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        pid=pid,
+        timeout=5.0,
+        label="ps",
+    )
+    # A zombie prints Z, optionally with a trailing + for a foreground group.
+    return result.stdout.strip()[:1]
+
+
 def pid_is_alive(pid: int, timeout: float) -> bool:
     if not 0 < pid <= MAX_PID:
         return False
@@ -73,6 +91,29 @@ def pid_is_alive(pid: int, timeout: float) -> bool:
                 f"tasklist exited with status {result.returncode} while checking whether pid {pid} is running"
             )
         return f'"{pid}"' in result.stdout and "no tasks are running" not in result.stdout.lower()
+    if sys.platform == "darwin":
+        # Ordered so the cheap syscall decides the common cases. A pid that is gone
+        # answers with an error and never reaches ps, and a pid that answers is the
+        # only one that can be a zombie. Callers poll this in a loop, so the fork
+        # is paid on the answer that is genuinely uncertain and nowhere else.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OverflowError:
+            return False
+        # A zombie outlives the answer only while its parent has not reaped it, and
+        # only this process can reap it. So a pid seen to be a zombie stays dead for
+        # us, and remembering that keeps the stop path from forking ps on every one
+        # of its polls. Nothing else is cached: a live pid can still become a zombie.
+        if pid in _ZOMBIES:
+            return False
+        if _darwin_state(pid) == "Z":
+            _ZOMBIES.add(pid)
+            return False
+        return True
     if sys.platform.startswith("linux"):
         try:
             state = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[-1].split(maxsplit=1)[0]

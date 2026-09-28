@@ -77,6 +77,20 @@ class ServerLifecycleTests(unittest.TestCase):
         finally:
             router.server_close()
 
+    def test_binding_does_not_resolve_the_host_name(self) -> None:
+        # HTTPServer.server_bind resolves the name between bind() and listen(), so
+        # a resolver that stalls holds the port bound but unserved and the launcher's
+        # health check fails for reasons that name no resolver. The router serves no
+        # name, so the lookup has to be gone.
+        resolved = []
+        with patch("socket.getfqdn", side_effect=lambda host: resolved.append(host) or host):
+            router = _RouterServer(("127.0.0.1", 0))
+        try:
+            self.assertEqual(resolved, [], "binding resolved the host name")
+            self.assertEqual(router.server_name, "127.0.0.1")
+        finally:
+            router.server_close()
+
 
 class EncodingTests(unittest.TestCase):
     def test_gzip_body_is_not_malformed(self):
@@ -395,7 +409,14 @@ class ResponseAttestationTests(unittest.TestCase):
         ):
             with self.subTest(path=path), _running_router((status_code, {}, body)) as router:
                 received_status, received_body = _post(router, path, model=model)
-            self.assertEqual((received_status, received_body), (status_code, body))
+            if model == "test-pool":
+                # A refusal is a member failure, so the pool is swept and the
+                # client is told the pool failed rather than handed one member's
+                # body as though it were the answer.
+                self.assertEqual(received_status, 503)
+                self.assertNotIn(b"content", received_body)
+            else:
+                self.assertEqual((received_status, received_body), (status_code, body))
 
     def test_direct_non_pooled_success_is_not_attested(self) -> None:
         body = b'{"model":"provider/direct","content":[{"type":"text","text":"ok"}]}'
@@ -1015,8 +1036,8 @@ class PoolReloadBoundaryTests(unittest.TestCase):
             with patch("modules.router._POOLS_STAT_INTERVAL", 0.0), \
                  self.assertLogs("cx.router", level="WARNING") as logs:
                 self.assertEqual(registry.names(), ["live"])
-                path.write_text('{"version":2,"pools":[{"name":"live","members":[{"model":"p/first"}]}]}',
-                                encoding="utf-8")
+                refused = '{"version":2,"pools":[{"name":"live","members":[{"model":"p/first"}]}]}'
+                path.write_text(refused + "\n" * len(refused), encoding="utf-8")
                 self.assertEqual(registry.names(), ["live"])
         reported = "\n".join(logs.output)
         self.assertIn("not a supported pool document", reported)
@@ -1833,16 +1854,23 @@ class ResponseCapTests(unittest.TestCase):
         self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
     def test_forwarded_error_and_passthrough_bodies_use_cap(self) -> None:
-        cases = (("/v1/messages", "test-pool", 400, "provider/first"),
-                 ("/v1/completions", "provider/direct", 500, "provider/direct"))
-        for path, model, upstream_status, expected_model in cases:
+        cases = (("/v1/messages", "test-pool", 400, 503),
+                 ("/v1/completions", "provider/direct", 500, 502))
+        for path, model, upstream_status, expected_status in cases:
             with self.subTest(path=path), patch("modules.router._MAX_RESPONSE_BYTES", 4096), _running_router(
                 (upstream_status, {}, b"x" * 9999),
             ) as router:
                 status, body = _post(router, path, model=model)
-            self.assertEqual(status, 502)
+            self.assertEqual(status, expected_status)
             self.assertNotIn(b"x" * 100, body)
-            self.assertEqual(router.upstream_state.models, [expected_model])
+        # The refusal is a member failure, so the pool is swept rather than one
+        # member's oversized body being handed on as the answer.
+        with patch("modules.router._MAX_RESPONSE_BYTES", 4096), _running_router(
+            *[(400, {}, b"x" * 9999)] * 4
+        ) as router:
+            self.assertEqual(_post(router, "/v1/messages", model="test-pool")[0], 503)
+            self.assertCountEqual(
+                router.upstream_state.models, ["provider/first", "provider/second"] * 2)
 
 
 class DirectPathTests(unittest.TestCase):

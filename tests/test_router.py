@@ -480,16 +480,35 @@ class PoolFailoverTests(unittest.TestCase):
                 ["provider/first", "provider/second"],
             )
 
-    def test_a_400_the_provider_never_recovers_from_is_terminal_and_forwarded(self) -> None:
-        error_body = (b'{"error":{"message":"Failed to deserialize the JSON body into the target '
-                      b'type: data did not match any variant of untagged enum '
-                      b'ChatCompletionRequestToolMessageContent at line 1 column 1234711"}}')
-        with _running_router((400, {}, error_body)) as router:
+    def test_a_400_from_one_member_fails_over_to_the_next(self) -> None:
+        rejection = b'{"error":{"message":"Failed to deserialize the JSON body into the target type"}}'
+        with _running_router((400, {}, rejection), (200, {}, _OK_BODY)) as router:
             status, body = _post(router)
 
-        self.assertEqual(status, 400)
-        self.assertEqual(body, error_body)
-        self.assertEqual(router.upstream_state.models, ["provider/first"])
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), json.loads(_OK_BODY))
+        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
+
+    def test_a_4xx_the_whole_pool_refuses_is_reported_as_exhausted(self) -> None:
+        for status_code in (400, 404, 422):
+            with self.subTest(status=status_code):
+                # Two sweeps over two members, so four refusals before the pool
+                # gives up; fewer and the fixture would answer the last attempt
+                # with its own default rather than the status under test.
+                refusal = (status_code, {}, b'{"error":{"message":"arbitrary rejection"}}')
+                with _running_router(*[refusal] * 4) as router:
+                    status, body = _post(router)
+
+                self.assertEqual(status, 503)
+                error = json.loads(body)["error"]
+                self.assertEqual(error["type"], "pool_exhausted")
+                self.assertEqual(
+                    {failure["status"] for failure in error["attempts"]}, {status_code})
+                self.assertEqual(len(error["attempts"]), 4)
+                self.assertCountEqual(
+                    router.upstream_state.models, ["provider/first", "provider/second"] * 2)
+                self.assertFalse(router.cooldowns.is_ready("provider/first"))
+                self.assertFalse(router.cooldowns.is_ready("provider/second"))
 
     def test_pooled_failure_does_not_log_provider_body(self) -> None:
         provider_secret = b"provider-body-secret"
@@ -628,20 +647,6 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(json.loads(refused[1])["error"]["type"], "pool_exhausted")
         self.assertCountEqual(
             router.upstream_state.models, ["provider/first", "provider/second"])
-
-    def test_terminal_4xx_forwarded_without_retry(self) -> None:
-        for status_code in (400, 404, 422):
-            with self.subTest(status=status_code):
-                with _running_router(
-                    (status_code, {}, b'{"error":{"message":"arbitrary rejection"}}'),
-                ) as router:
-                    status, body = _post(router)
-
-                self.assertEqual(status, status_code)
-                self.assertEqual(body, b'{"error":{"message":"arbitrary rejection"}}')
-                self.assertEqual(router.upstream_state.models, ["provider/first"])
-                self.assertTrue(router.cooldowns.is_ready("provider/first"))
-                self.assertTrue(router.cooldowns.is_ready("provider/second"))
 
     def test_second_sweep_recovers_a_member_that_failed_the_first(self) -> None:
         with _running_router(

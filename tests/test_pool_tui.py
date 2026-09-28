@@ -573,34 +573,47 @@ class ConflictRecoveryTests(unittest.TestCase):
         def first_publish_only(real):
             def build(fault, _pools_path):
                 state = [0]
+                fired = []
 
                 def side_effect(*args, **kwargs):
                     state[0] += 1
                     if state[0] == 1:
+                        fired.append(state[0])
                         raise fault
                     return real(*args, **kwargs)
+
+                side_effect.fired = fired
                 return side_effect
             return build
 
         def dead_descriptor_once(real):
             def build(_error, _pools_path):
                 state = [0]
+                fired = []
 
                 def side_effect(*args, **kwargs):
                     state[0] += 1
                     descriptor, name = real(*args, **kwargs)
                     if state[0] == 1:
+                        fired.append(state[0])
                         os.close(descriptor)
                     return descriptor, name
+
+                side_effect.fired = fired
                 return side_effect
             return build
 
         def live_pools_file_only(real):
             def build(fault, pools_path):
+                fired = []
+
                 def side_effect(source, target):
-                    if Path(target) == pools_path:
+                    if Path(os.path.realpath(target)) == Path(os.path.realpath(pools_path)):
+                        fired.append(target)
                         raise fault
                     return real(source, target)
+
+                side_effect.fired = fired
                 return side_effect
             return build
 
@@ -623,6 +636,8 @@ class ConflictRecoveryTests(unittest.TestCase):
                 ):
                     result = _save_pools_or_recover(pools, models)
 
+                if fired := getattr(faulted, "fired", None):
+                    self.assertTrue(fired, f"{name} was never faulted, so nothing was tested")
                 self.assertFalse(result, f"{name} reported a published save")
                 artifacts = list(Path(directory).glob("pools.conflict*.json"))
                 self.assertEqual(len(artifacts), 1, f"{name} left {artifacts}")

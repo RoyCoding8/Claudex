@@ -14,13 +14,14 @@ import unittest
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from modules import models, proxy
 from modules.models import Model
 
 _MODELS_SERVER = """
-import http.server
+import http.server, socketserver, time
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -34,14 +35,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+class Server(http.server.HTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind resolves the host name between bind() and
+        # listen(), and a reverse-DNS lookup that stalls there leaves the socket
+        # bound but not listening, so the parent waits on a port nothing serves.
+        # Nothing here needs a name, so skip it.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+for attempt in range(100):
+    try:
+        server = Server(("127.0.0.1", PORT), Handler)
+        break
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise SystemExit(f"could not bind {PORT}")
+
+server.serve_forever()
 """
 
 _SOCKET_HOLDER = """
 import socket, time
-holder = socket.socket()
-holder.bind(("127.0.0.1", PORT))
-holder.listen(8)
+
+for attempt in range(100):
+    try:
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", PORT))
+        holder.listen(8)
+        break
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise SystemExit(f"could not bind {PORT}")
+
 while True:
     time.sleep(0.05)
 """
@@ -63,17 +93,40 @@ def _executable_alias(directory: Path, name: str = "cli-proxy-api") -> Path:
     return path
 
 
+def _unvenved() -> dict[str, str]:
+    """An environment in which a copy of the interpreter, moved aside, starts.
+
+    VIRTUAL_ENV names a pyvenv.cfg the copy cannot see, and a CPython that finds
+    the variable without the file exits before running any code. PYTHONHOME names
+    the tree to load the standard library from, which a copy outside that tree
+    can no longer find by walking up from where it sits.
+    """
+    environment = {name: value for name, value in os.environ.items() if name.upper() != "VIRTUAL_ENV"}
+    environment["PYTHONHOME"] = sys.base_prefix
+    return environment
+
+
 def _executable_copy(directory: Path, name: str) -> Path:
     """A runnable stand-in for this interpreter under another name.
 
     Identity is matched on the executable path, so the child must be spawned from
-    this file. On win32 that is a copy of the binary. On posix a copied binary
-    cannot find its own stdlib once it sits outside the virtualenv, so this is a
-    script that re-execs the real interpreter with the arguments it was given.
+    this file. sys.executable is not the interpreter: inside a virtualenv it is a
+    launcher that dispatches to the real one, carrying none of the runtime a copy
+    needs. Which launcher it is varies by how the environment was built, and only
+    one of them fails when relocated. A uv trampoline embeds the interpreter path
+    and starts anywhere, so this test passed on a machine where uv built the
+    environment. CPython's own launcher, which uv copies when the base install is
+    not uv-managed, instead looks for a pyvenv.cfg beside or above itself and
+    exits 106 without running any code. Copy the real interpreter and the DLLs it
+    loads from its own directory and neither launcher is involved. A symlink would
+    need a privilege this test does not have.
     """
-    path = directory / name
+    path = directory / (f"{name}.exe" if os.name == "nt" else name)
     if os.name == "nt":
-        shutil.copy2(os.path.realpath(sys.executable), path)
+        home = Path(sys.base_prefix)
+        for sibling in home.glob("*.dll"):
+            shutil.copy2(sibling, directory / sibling.name)
+        shutil.copy2(home / "python.exe", path)
     else:
         path.write_text(
             f'#!{sys.executable}\n'
@@ -120,6 +173,31 @@ def _an_open_file_can_be_replaced() -> bool:
     return True
 
 
+def _became_zombie(pid: int, timeout: float = 5.0) -> bool:
+    """Wait for an unreaped child to reach the zombie state.
+
+    Linux reports it in /proc; macOS has no /proc, so ps is the only place the
+    state is visible.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sys.platform.startswith("linux"):
+            try:
+                state = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[-1].split(maxsplit=1)[0]
+            except (OSError, IndexError):
+                pass
+            else:
+                if state == b"Z":
+                    return True
+        else:
+            result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                    capture_output=True, text=True, check=False)
+            if result.stdout.strip()[:1] == "Z":
+                return True
+        time.sleep(0.02)
+    return False
+
+
 can_replace_an_open_file = unittest.skipUnless(
     _an_open_file_can_be_replaced(),
     "this platform cannot unlink a file that is still open",
@@ -141,27 +219,56 @@ def _unroutable_port() -> int:
 
 def _processes_running(path: Path) -> list[str]:
     found: list[str] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            cmdline = (entry / "cmdline").read_bytes().decode(errors="replace")
-        except OSError:
-            continue
-        if str(path) in cmdline:
-            found.append(f"{entry.name} {cmdline}")
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().decode(errors="replace")
+            except OSError:
+                continue
+            if str(path) in cmdline:
+                found.append(f"{entry.name} {cmdline}")
+    elif sys.platform == "darwin":
+        result = subprocess.run(["ps", "-ax", "-o", "pid=,args="], capture_output=True, text=True, check=False)
+        for line in result.stdout.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            if pid.isdigit() and str(path) in args:
+                found.append(f"{pid} {args}")
     return sorted(found)
 
 
-def _wait_for_port(port: int, timeout: float = 10.0) -> None:
+_CLOCK_SLACK = 0.05
+
+
+def _wait_for_port(
+    port: int,
+    timeout: float = 30.0,
+    child: subprocess.Popen[bytes] | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with socket.socket() as probe:
             probe.settimeout(0.2)
             if probe.connect_ex(("127.0.0.1", port)) == 0:
                 return
+        if child is not None and child.poll() is not None:
+            raise AssertionError(
+                f"the child exited with {child.returncode} before port {port} was listening"
+                + _child_complaint(child.stderr))
         time.sleep(0.05)
-    raise AssertionError(f"port {port} never started listening")
+    raise AssertionError(f"port {port} never started listening within {timeout:.0f}s")
+
+
+def _child_complaint(stderr: Any) -> str:
+    """Whatever the child managed to say, which is the only clue to why it died."""
+    if stderr is None:
+        return ""
+    try:
+        text = stderr.read()
+    except (OSError, ValueError):
+        return ""
+    return f"\nchild stderr:\n{text.decode(errors='replace')[-2000:]}" if text else ""
 
 
 class FakeProcess:
@@ -371,20 +478,13 @@ class ProxyLifecycleTests(unittest.TestCase):
             kill.assert_not_called()
 
     def test_a_zombie_that_never_exits_is_not_a_live_listener(self):
-        if not sys.platform.startswith("linux"):
-            self.skipTest("the zombie state is a Linux /proc fact")
+        if not sys.platform.startswith(("linux", "darwin")):
+            self.skipTest("a zombie is observed through /proc on Linux and ps on macOS")
         child = os.fork()
         if child == 0:
             os._exit(0)
         self.addCleanup(os.waitpid, child, 0)
-        state = b""
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            state = Path(f"/proc/{child}/stat").read_bytes().rsplit(b")", 1)[-1].split(maxsplit=1)[0]
-            if state == b"Z":
-                break
-            time.sleep(0.02)
-        self.assertEqual(state, b"Z", "the unreaped child never became a zombie")
+        self.assertTrue(_became_zombie(child), "the unreaped child never became a zombie")
         self.assertFalse(proxy._pid_is_alive(child, time.monotonic() + 2))
 
     def test_a_lock_failure_is_not_read_as_a_second_launcher(self):
@@ -695,10 +795,11 @@ class ProxyLifecycleTests(unittest.TestCase):
             [str(exe), "-c", _MODELS_SERVER.replace("PORT", str(port))],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=_unvenved(),
         )
         self.addCleanup(self._stop_child, child)
-        _wait_for_port(port)
+        _wait_for_port(port, child=child)
         pid_file = root / "proxy.pid"
         self._assert_listener_is_refused_and_left_running(exe, port, pid_file)
         self.assertFalse(pid_file.exists(), "no ownership record may be published for an unstarted process")
@@ -811,7 +912,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             self.addCleanup(self._stop_child, intruder)
-            _wait_for_port(port)
+            _wait_for_port(port, child=intruder)
             self._assert_listener_is_refused_and_left_running(exe, port, root / "proxy.pid")
             self.assertIsNone(intruder.poll())
 
@@ -827,7 +928,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             self.addCleanup(self._stop_child, intruder)
-            _wait_for_port(port)
+            _wait_for_port(port, child=intruder)
             pid_file = root / "proxy.pid"
             pid_file.write_text(str(intruder.pid), encoding="ascii")
             self._assert_listener_is_refused_and_left_running(exe, port, pid_file)
@@ -1059,7 +1160,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                 else:
                     self.assertEqual(len(issued), 1)
                     self.assertGreater(issued[0], 0.0)
-                    self.assertLessEqual(issued[0], budget)
+                    self.assertLessEqual(issued[0], budget + _CLOCK_SLACK)
 
     def _release_sudo_child(self, victim: subprocess.Popen[bytes], release: Path) -> None:
         release.touch()

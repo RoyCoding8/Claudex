@@ -358,10 +358,20 @@ def _stop_lock() -> TextIO | None:
     return None
 
 
+def _refused(reason: str) -> StopOutcome:
+    """Refuse, saying which check refused.
+
+    Three different things end in the same outcome, and a bare enum leaves a
+    failed stop with no way to tell a held lock from a process that would not die.
+    """
+    print(f"router stop refused: {reason}", file=sys.stderr)
+    return StopOutcome.REFUSED
+
+
 def stop_router() -> StopOutcome:
     lock = _stop_lock()
     if lock is None:
-        return StopOutcome.REFUSED
+        return _refused("the startup lock stayed held")
     try:
         pid = _read_pid()
         was_running = pid is not None and _pid_is_alive(pid)
@@ -372,9 +382,11 @@ def stop_router() -> StopOutcome:
             if _pid_is_alive(pid):
                 _sweep_router_listeners()
         if not process.wait_until(lambda: _router_stopped(pid), _STOP_TIMEOUT):
-            return StopOutcome.REFUSED
+            return _refused(
+                f"pid {pid} is {'alive' if pid is not None and _pid_is_alive(pid) else 'gone'}"
+                f" and the port is {'open' if _port_is_open() else 'closed'}")
         if _clear_router_claims(pid):
-            return StopOutcome.REFUSED
+            return _refused("an ownership claim survived")
         return StopOutcome.STOPPED if was_running else StopOutcome.ABSENT
     finally:
         _release_startup_lock(lock)

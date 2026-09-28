@@ -51,6 +51,17 @@ def _health_server(body: bytes, identity: str = "foreign/1"):
         thread.join(timeout=2)
 
 
+def _child_complaint(stderr) -> str:
+    """Whatever the child managed to say, which is the only clue to why it failed."""
+    if stderr is None:
+        return ""
+    try:
+        text = stderr.read()
+    except (OSError, ValueError):
+        return ""
+    return f"\nchild stderr:\n{text.decode(errors='replace')[-2000:]}" if text else ""
+
+
 @contextmanager
 def _bound_child(ignore_sigterm: bool = False):
     with socket.socket() as probe:
@@ -64,6 +75,8 @@ def _bound_child(ignore_sigterm: bool = False):
 def _listening_child(port: int, ignore_sigterm: bool = False):
     child_code = """
 import signal
+import socket
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 """ + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_sigterm else "") + """
@@ -83,20 +96,51 @@ class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "cx-router/1.1"
 
-HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+class Bound(HTTPServer):
+    # HTTPServer sets allow_reuse_address, and on a BSD socket that lets a second
+    # bind succeed on a port another process already holds, so this child would
+    # quietly take a port it was only meant to be sharing. allow_reuse_port is
+    # the BSD spelling of the same idea and is on by default on macOS.
+    allow_reuse_address = False
+    if hasattr(socket, "SO_REUSEPORT"):
+        allow_reuse_port = False
+
+    def server_bind(self):
+        # HTTPServer.server_bind resolves the host name between bind() and
+        # listen(), and a reverse-DNS lookup that stalls there leaves the socket
+        # bound but not listening: the parent waits, the child is alive, and
+        # nothing is written anywhere. Nothing here needs a name, so skip it.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+try:
+    Bound(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+except OSError as error:
+    sys.stderr.write("bind failed: %r\\n" % (error,))
+    raise
 """
-    process = subprocess.Popen([sys.executable, "-c", child_code, str(port)], cwd=str(rs._ROUTER_ROOT))
-    deadline = time.monotonic() + 5
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(port)],
+        cwd=str(rs._ROUTER_ROOT),
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                 break
         except OSError:
+            if process.poll() is not None:
+                raise AssertionError(
+                    f"the child listener exited with {process.returncode}"
+                    + _child_complaint(process.stderr)) from None
             time.sleep(0.02)
     else:
         process.kill()
         process.wait(timeout=5)
-        raise AssertionError("child listener did not bind")
+        raise AssertionError("child listener did not bind within 30s" + _child_complaint(process.stderr))
     try:
         yield process
     finally:
@@ -125,6 +169,8 @@ def _spawned_router_on(port: int):
 
 
 _ROUTER_CHILD = """
+import socket
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -143,7 +189,30 @@ class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "cx-router/1.1"
 
-HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+class Bound(HTTPServer):
+    # HTTPServer sets allow_reuse_address, and on a BSD socket that lets a second
+    # bind succeed on a port another process already holds, so this child would
+    # quietly take a port it was only meant to be sharing. allow_reuse_port is
+    # the BSD spelling of the same idea and is on by default on macOS.
+    allow_reuse_address = False
+    if hasattr(socket, "SO_REUSEPORT"):
+        allow_reuse_port = False
+
+    def server_bind(self):
+        # HTTPServer.server_bind resolves the host name between bind() and
+        # listen(), and a reverse-DNS lookup that stalls there leaves the socket
+        # bound but not listening: the parent waits, the child is alive, and
+        # nothing is written anywhere. Nothing here needs a name, so skip it.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+try:
+    Bound(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+except OSError as error:
+    sys.stderr.write("bind failed: %r\\n" % (error,))
+    raise
 """
 
 

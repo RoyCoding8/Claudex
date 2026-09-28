@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -802,16 +803,15 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 try:
                     upstream = _forward_to_upstream(
                         "POST", path, _upstream_headers(self.headers, rewritten), rewritten, deadline)
-                    retry = _classify_retry(upstream, path=urlsplit(path).path, deadline=deadline)
-                    if retry is None:
+                    verdict = _judge_response(upstream, path=urlsplit(path).path, deadline=deadline)
+                    if verdict is None:
                         streamed = True
                         if self._stream_upstream(upstream, request_id=request_id, member=member.model, deadline=deadline, path=urlsplit(path).path):
-                            if 200 <= upstream.status < 300:
-                                cooldowns.clear(member.model)
+                            cooldowns.clear(member.model)
                         else:
                             cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "stream_drop")
                         return
-                    category, delay = retry
+                    category, delay = verdict
                     if category == "rate_limit" and not _has_retry_after(upstream.headers):
                         delay = member.cooldown if member.cooldown is not None else (
                             _COOLDOWN_ON_PACED_429 if member.limit is not None else delay
@@ -872,7 +872,17 @@ class _RouterHandler(BaseHTTPRequestHandler):
                 _LOG.warning("request=%s direct attempt=%d path=%s category=network error=%s",
                              request_id, attempt, _log_text(path), _log_text(error))
                 continue
-            verdict = _classify_retry(upstream, path=route_path, deadline=deadline) if pooled else None
+            # A non-pooled path has no other member to try, so there is nothing to
+            # gain from judging the body: the upstream's answer is the answer, and
+            # re-reading a broken stream would only report what the client already
+            # saw. A pooled path is judged so a bad member can be left behind.
+            if not pooled:
+                self._stream_upstream(
+                    upstream, request_id=request_id,
+                    member=None,
+                    deadline=deadline, path=route_path)
+                return
+            verdict = _judge_response(upstream, path=route_path, deadline=deadline)
             if verdict is None or verdict[0] not in _INTEGRITY_FAILURES:
                 self._stream_upstream(
                     upstream, request_id=request_id,
@@ -1350,10 +1360,16 @@ def _validate_body(upstream: _UpstreamResponse, path: str,
     return None
 
 
-_RETRYABLE_4XX = frozenset({408, 409, 425})
+def _judge_response(upstream: _UpstreamResponse, *, path: str, deadline: float) -> tuple[str, float] | None:
+    """Name the failure and say how long the member is out, or None if it is sound.
 
-
-def _classify_retry(upstream: _UpstreamResponse, *, path: str, deadline: float) -> tuple[str, float] | None:
+    A member that fails is a member to leave: the next one may well serve the
+    request, and stopping at the first refusal lets one member that rejects a
+    capability take the whole pool down. The response only decides the label and
+    the cooldown; whether to keep going is the caller's, and for a pool it always
+    is. A 2xx the grammar accepts is the one answer that is not a failure, which
+    is why this is not a failure count.
+    """
     if 200 <= upstream.status < 300:
         grammar = _grammar_for(path)
         if _is_event_stream(upstream.headers):
@@ -1363,8 +1379,6 @@ def _classify_retry(upstream: _UpstreamResponse, *, path: str, deadline: float) 
         return "rate_limit", _retry_after_seconds(upstream.headers, _COOLDOWN_ON_429_DEFAULT)
     if upstream.status in _AUTH_STATUS:
         return "auth", _COOLDOWN_ON_AUTH
-    if 400 <= upstream.status < 500 and upstream.status not in _RETRYABLE_4XX:
-        return None
     return "upstream", _COOLDOWN_ON_5XX
 
 
@@ -1386,6 +1400,16 @@ def _read_bounded_body(upstream: _UpstreamResponse) -> bytes | None:
 class _RouterServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind resolves the host name between bind() and
+        # listen(). A reverse-DNS lookup that stalls there holds the port bound
+        # but unserved, and the launcher's health check then fails for reasons
+        # that name no resolver. The router never serves a name, so skip it.
+        socketserver.TCPServer.server_bind(self)
+        host = self.server_address[0]
+        self.server_name = host.decode() if isinstance(host, (bytes, bytearray)) else host
+        self.server_port = self.server_address[1]
 
     def __init__(self, address: tuple[str, int]) -> None:
         self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET

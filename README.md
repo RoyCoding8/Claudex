@@ -11,9 +11,7 @@
 <p align="center">
   <a href="https://github.com/RoyCoding8/Claudex/actions/workflows/tests.yml"><img alt="tests" src="https://github.com/RoyCoding8/Claudex/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://github.com/RoyCoding8/Claudex/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
-  <img alt="python" src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776AB.svg">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-2-blue.svg">
-  <img alt="build step" src="https://img.shields.io/badge/no%20build%20step-success.svg">
 </p>
 
 <p align="center">
@@ -45,9 +43,8 @@ optional `.env` loading. There is no build step.
 |---|---|
 | **Router** | stdlib only, `modules/router.py` |
 | **Runtime deps** | `prompt-toolkit`, `python-dotenv` |
-| **Python** | 3.11, 3.12, 3.13 |
 | **Build step** | none |
-| **Tests** | 531, hermetic, on Windows and Linux |
+| **Tests** | 533, hermetic, on Windows, macOS and Linux |
 
 ## Quick start
 
@@ -326,12 +323,12 @@ OK and still deletes `data/cli-proxy-api.pid`. A full `discover -s tests` surviv
 `tests/test_repository_hygiene.py` imports the package as it loads, which installs the guard before
 any test runs; that is incidental, so keep `-t .`.
 
-The project pins `python >=3.11,<3.14`: `python-dotenv` and prompt-toolkit are exercised on that
-range, and a bare system interpreter may lack them. Use the `uv run` form above (or the project
-`.venv`), not whichever `python` is first on PATH.
+A bare system interpreter may lack `python-dotenv` and prompt-toolkit, so use the
+`uv run` form above (or the project `.venv`), not whichever `python` is first on
+PATH.
 
-CI runs the same command, plus `ruff check`, on `windows-latest` and
-`ubuntu-latest` against Python 3.11, 3.12, and 3.13 (`.github/workflows/tests.yml`) for every push
+CI runs the same command, plus `ruff check`, on `windows-latest`, `macos-latest`
+and `ubuntu-latest` (`.github/workflows/tests.yml`) for every push
 to `main` and every pull request. Type checking runs three times, once per
 platform (`mypy modules`, then `--platform win32` and `--platform darwin`), because
 `mypy` only checks the branches its own platform can reach: a `win32` branch is
