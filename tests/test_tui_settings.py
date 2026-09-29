@@ -200,15 +200,22 @@ def _write_settings_in_process(settings_path, key, value, barrier, results) -> N
         results.put(("ok", key))
 
 
-class SettingsTests(unittest.TestCase):
+class _ScreenAssertions(unittest.TestCase):
     def _assert_shows(self, screen: str, text: str) -> None:
         self.assertIn("".join(text.split()), "".join(screen.split()))
 
-    def _assert_roles_row(self, screen: str) -> None:
+    def _assert_roles_row(
+        self, screen: str, fast: str = "default", medium: str = "default", subagent: str = "default"
+    ) -> None:
         rows = [row for row in screen.splitlines() if "Fast:" in row]
         self.assertEqual(len(rows), 1, screen)
-        for label in ("Fast:", "Medium:", "Subagent:", "GW:"):
-            self.assertIn(label, rows[0])
+        squeezed = "".join(rows[0].split())
+        for label, value in (("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent)):
+            self.assertIn(f"{label}{value}", squeezed)
+        self.assertIn("GW:", squeezed)
+
+
+class SettingsTests(_ScreenAssertions):
 
     def test_malformed_nested_model_settings_are_removed_on_save(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -315,7 +322,14 @@ class SettingsTests(unittest.TestCase):
             with (
                 patch.object(tui, "SETTINGS_FILE", settings),
                 patch.object(tui, "DATA_DIR", data_dir),
+                patch.object(tui.Path, "replace", side_effect=OSError("refused")),
             ):
+                with self.assertRaises(OSError):
+                    set_extra_model("gpt_fast_model", "fast/model")
+
+            self.assertEqual(list(data_dir.glob("*.tmp")), [])
+
+            with patch.object(tui, "SETTINGS_FILE", settings), patch.object(tui, "DATA_DIR", data_dir):
                 set_extra_model("gpt_fast_model", "fast/model")
                 set_extra_model("gpt_medium_model", "medium/model")
 
@@ -1027,20 +1041,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(temporary_files, [])
 
 
-class PickerDeltaTests(unittest.TestCase):
-    def _assert_shows(self, screen: str, text: str) -> None:
-        self.assertIn("".join(text.split()), "".join(screen.split()))
-
-    def _assert_roles_row(
-        self, screen: str, fast: str = "default", medium: str = "default", subagent: str = "default"
-    ) -> None:
-        rows = [row for row in screen.splitlines() if "Fast:" in row]
-        self.assertEqual(len(rows), 1, screen)
-        squeezed = "".join(rows[0].split())
-        for label, value in (("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent)):
-            self.assertIn(f"{label}{value}", squeezed)
-        self.assertIn("GW:", squeezed)
-
+class PickerDeltaTests(_ScreenAssertions):
     def _drive(self, keys, initial, during=None, model=None, **patches):
         result, source, session, _ = _drive_picker(
             keys,
@@ -1282,10 +1283,7 @@ class PickerDeltaTests(unittest.TestCase):
         self.assertEqual(source, original)
 
 
-class PickerScreenTests(unittest.TestCase):
-    def _assert_shows(self, screen: str, text: str) -> None:
-        self.assertIn("".join(text.split()), "".join(screen.split()))
-
+class PickerScreenTests(_ScreenAssertions):
     def test_the_footer_renders_the_same_text_at_every_terminal_width(self):
         oracle = _footer_text(_drive_picker(columns=200)[2].screens[-1])
         self.assertNotEqual(oracle, "")

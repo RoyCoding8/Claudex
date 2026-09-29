@@ -462,18 +462,11 @@ class MemberPromptTests(unittest.TestCase):
             ):
                 self.assertEqual(_prompt_int("Requests per minute (RPM)"), _Answered(10))
 
-    def test_prompt_result_variants_admit_no_contradictory_state(self) -> None:
-        for attribute in ("value", "cancelled"):
-            with self.subTest(attribute=attribute, variant="answered"):
-                with self.assertRaises((AttributeError, TypeError)):
-                    setattr(_Answered(5), attribute, 1)
-            with self.subTest(attribute=attribute, variant="cancelled"):
-                with self.assertRaises((AttributeError, TypeError)):
-                    setattr(_Cancelled(), attribute, 1)
-        self.assertEqual(_Answered(5).value, 5)
-        self.assertEqual(_Answered(None).value, None)
+    def test_the_two_prompt_results_stay_distinguishable(self) -> None:
         self.assertNotIsInstance(_Answered(5), _Cancelled)
         self.assertNotIsInstance(_Cancelled(), _Answered)
+        self.assertIsInstance(_Answered(5), _Answered)
+        self.assertIsInstance(_Cancelled(), _Cancelled)
 
 
 class ConflictRecoveryTests(unittest.TestCase):

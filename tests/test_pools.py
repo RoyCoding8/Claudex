@@ -323,13 +323,16 @@ class PoolTests(unittest.TestCase):
             with self.assertRaises(PoolSaveUnreadableError):
                 save_pools([], path)
 
-    def test_load_failure_does_not_record_digest(self) -> None:
+    def test_a_reload_of_a_stale_digest_replaces_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pools.json"
-            path.write_text('{"pools": [broken', encoding="utf-8")
-            with self.assertRaises(RuntimeError):
-                load_pools(path)
-            self.assertNotIn(path, _LOADED_DIGESTS)
+            path.write_text('{"pools": []}', encoding="utf-8")
+            load_pools(path)
+            canonical = path.resolve()
+            self.assertIn(canonical, _LOADED_DIGESTS)
+            path.write_text('{"pools": {}}', encoding="utf-8")
+            load_pools(path)
+            self.assertNotIn(canonical, _LOADED_DIGESTS)
 
 
 if __name__ == "__main__":

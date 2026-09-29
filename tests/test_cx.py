@@ -437,15 +437,38 @@ class PromptBoundarySourceTests(unittest.TestCase):
         self.assertEqual(callers, {"_ask"})
 
 
-class WindowsWrapperSourceTests(unittest.TestCase):
-    def setUp(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        self.source = (root / "cx.bat").read_text(encoding="utf-8")
-
+@unittest.skipUnless(os.name == "nt", "Windows batch wrapper test")
+class WindowsWrapperTests(unittest.TestCase):
     def test_batch_forwards_original_quoted_arguments_without_reassembly(self):
-        self.assertIn('uv run --project "%~dp0" python "%~dp0cx.py" %*', self.source.splitlines())
-        for parser_shape in (":parse", "%~1", "CX_ARGS", "shift", "~0,-1"):
-            self.assertNotIn(parser_shape, self.source)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            received = root / "received"
+            root.joinpath("dump.py").write_text(
+                "import os, sys\n"
+                "open(os.environ['CX_CAPTURE'], 'wb')"
+                ".write(b'\\0'.join(a.encode() for a in sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            root.joinpath("uv.cmd").write_text('@echo off\r\npython "%~dp0dump.py" %*\r\n', encoding="utf-8")
+            project = Path(__file__).resolve().parents[1]
+            environment = os.environ.copy()
+            environment.update(CX_CAPTURE=str(received), PATH=f"{root};{environment['PATH']}")
+            forwarded = ["--flag=a_b", r"C:\a b\c d.txt", "--x=1 2"]
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", str(project / "cx.bat")] + forwarded,
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(received.exists(), (result.stdout, result.stderr))
+            captured = received.read_bytes().split(b"\0")
+            self.assertEqual(captured[-len(forwarded):], [a.encode() for a in forwarded])
+            self.assertEqual(len(captured), 5 + len(forwarded), captured)
+            self.assertEqual(captured[:2], [b"run", b"--project"], captured)
+            self.assertTrue(captured[4].endswith(b"\\cx.py"), captured)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX shell wrapper test")

@@ -298,10 +298,10 @@ class RoundRobinTests(unittest.TestCase):
 
     def test_cursor_resets_when_member_count_changes(self) -> None:
         rotation = _Rotation()
-        self.assertEqual(rotation.reserve("p", 3, lambda cursor: 2), 2)
-        self.assertEqual(rotation.cursor("p", 3), 0)
-        self.assertEqual(rotation.reserve("p", 2, lambda cursor: 1), 1)
-        self.assertEqual(rotation.cursor("p", 2), 0)
+        self.assertEqual(rotation.reserve("p", 3, lambda cursor: cursor), 0)
+        self.assertEqual(rotation.reserve("p", 3, lambda cursor: cursor), 1)
+        self.assertEqual(rotation.reserve("p", 2, lambda cursor: cursor), 0)
+        self.assertEqual(rotation.cursor("p", 2), 1)
 
 
 def _mk_pool_limited(*members: tuple[str, int, int, int | None],
@@ -714,7 +714,7 @@ class PoolFailoverTests(unittest.TestCase):
 
             self.assertFalse(router.cooldowns.is_ready("provider/first"))
 
-            with patch("modules.router._now", return_value=time.monotonic() + 120.0):
+            with patch("modules.router._now", return_value=time.monotonic() + 30.0):
                 self.assertTrue(router.cooldowns.is_ready("provider/first"))
 
     def test_provider_retry_after_overrides_paced_cooldown(self) -> None:

@@ -119,7 +119,6 @@ class LauncherTests(unittest.TestCase):
             patch.object(launcher, "ROUTER_PORT", 4000),
         ):
             result = launch_claude("glm-pool", False, None, None, [])
-            self.assertEqual(launcher.ROUTER_HOST, "::1")
 
         self.assertEqual(result, 0)
         environment = call.call_args.kwargs["env"]

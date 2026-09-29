@@ -294,7 +294,7 @@ class ModelFetchTests(unittest.TestCase):
     @patch("modules.models._open_url")
     def test_truncated_body_raises_runtime_error(self, urlopen) -> None:
         from http.client import IncompleteRead
-        response = urlopen.return_value
+        response = urlopen.return_value.__enter__.return_value
         response.read.side_effect = IncompleteRead(b"partial")
         with self.assertRaisesRegex(RuntimeError, "invalid model response"):
             fetch_models_from("127.0.0.1", 4000, "key", "test router")

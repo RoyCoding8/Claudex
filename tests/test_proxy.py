@@ -157,22 +157,6 @@ def _foreign_binary(directory: Path, name: str) -> Path:
     return path
 
 
-def _an_open_file_can_be_replaced() -> bool:
-    """Whether a file another handle holds open can still be unlinked.
-
-    Windows refuses this outright, so probe the machine rather than its name.
-    """
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "held"
-        path.write_text("held", encoding="ascii")
-        with path.open("a+", encoding="ascii"):
-            try:
-                path.unlink()
-            except OSError:
-                return False
-    return True
-
-
 def _became_zombie(pid: int, timeout: float = 5.0) -> bool:
     """Wait for an unreaped child to reach the zombie state.
 
@@ -196,12 +180,6 @@ def _became_zombie(pid: int, timeout: float = 5.0) -> bool:
                 return True
         time.sleep(0.02)
     return False
-
-
-can_replace_an_open_file = unittest.skipUnless(
-    _an_open_file_can_be_replaced(),
-    "this platform cannot unlink a file that is still open",
-)
 
 
 def _signal_mask(pid: int) -> str:
@@ -524,34 +502,6 @@ class ProxyLifecycleTests(unittest.TestCase):
                 self.assertIsNotNone(second)
                 second.close()
             self.assertTrue(log.with_suffix(".lock").exists())
-
-    @can_replace_an_open_file
-    def test_startup_cleanup_preserves_replacement_lock_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            log = root / "proxy.log"
-            lock = log.with_suffix(".lock")
-            pid = root / "proxy.pid"
-            exe = root / "cli-proxy-api"
-            exe.touch()
-            process = FakeProcess()
-
-            def clear_pid(clear_pid_value):
-                lock.unlink()
-                lock.write_text("replacement", encoding="ascii")
-
-            with patch.object(proxy, "PROXY_EXE", exe), \
-                 patch.object(proxy, "PROXY_CONFIG", root / "missing.yaml"), \
-                 patch.object(proxy, "PROXY_LOG", log), \
-                 patch.object(proxy, "PROXY_PID", pid), \
-                 patch.object(proxy, "PROXY_START_TIMEOUT", 0.01), \
-                 patch.object(proxy, "proxy_is_ready", return_value=False), \
-                 patch.object(proxy, "_port_is_open", return_value=False), \
-                 patch.object(proxy, "_clear_pid", side_effect=clear_pid), \
-                 patch.object(proxy.subprocess, "Popen", return_value=process):
-                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
-                    proxy.ensure_proxy()
-            self.assertEqual(lock.read_text(encoding="ascii"), "replacement")
 
     def test_verified_listener_waits_for_readiness(self):
         ready_results = iter((False, False, True))

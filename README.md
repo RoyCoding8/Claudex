@@ -44,7 +44,7 @@ optional `.env` loading. There is no build step.
 | **Router** | stdlib only, `modules/router.py` |
 | **Runtime deps** | `prompt-toolkit`, `python-dotenv` |
 | **Build step** | none |
-| **Tests** | 533, hermetic, on Windows, macOS and Linux |
+| **Tests** | 526, hermetic, on Windows, macOS and Linux |
 
 ## Quick start
 
