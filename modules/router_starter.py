@@ -115,7 +115,7 @@ def _macos_process_cwd(pid: int, deadline: float) -> Path | None:
 def _pid_is_router_windows(pid: int) -> bool:
     command = (
         "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=" + str(pid) + "';"
-        "if($p){$p.Name+'`n'+$p.CommandLine}"
+        'if($p){$p.Name+"`n"+$p.CommandLine}'
     )
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
