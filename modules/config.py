@@ -13,7 +13,7 @@ from typing import TypeVar
 
 from dotenv import dotenv_values
 
-from .urls import is_local_host
+from .urls import is_local_host, is_wildcard_host
 
 _T = TypeVar("_T", int, float)
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
@@ -205,6 +205,7 @@ ROUTER_PORT = _env_int("CX_ROUTER_PORT", "CX_LITELLM_PORT", default=4000, minimu
 ROUTER_API_KEY = _env("CX_ROUTER_API_KEY", "CX_LITELLM_API_KEY", default=_DEFAULT_ROUTER_API_KEY)
 ROUTER_LOG, ROUTER_PID = DATA_DIR / "router.log", DATA_DIR / "router.pid"
 ROUTER_BOOT_LOG = DATA_DIR / "router.boot.log"
+ROUTER_STATE_FILE = DATA_DIR / "router-state.json"
 ROUTER_START_TIMEOUT = _env_float("CX_ROUTER_START_TIMEOUT", default=35.0, minimum=0.1)
 ROUTER_COOLDOWN_429 = _env_float("CX_ROUTER_COOLDOWN_429", default=60.0, minimum=1.0, maximum=1800.0)
 ROUTER_COOLDOWN_5XX = _env_float("CX_ROUTER_COOLDOWN_5XX", default=30.0, minimum=1.0, maximum=1800.0)
@@ -221,14 +222,14 @@ DEFAULT_GPT_MEDIUM_MODEL = _env("CX_GPT_MEDIUM_MODEL", default="")
 DEFAULT_GPT_SUBAGENT_MODEL = _env("CX_GPT_SUBAGENT_MODEL", default="")
 DEFAULT_COMPACT_WINDOW = _env_int("CX_DEFAULT_COMPACT_WINDOW", default=170000, minimum=1)
 
-if not is_local_host(PROXY_HOST) and PROXY_API_KEY == _DEFAULT_PROXY_API_KEY:
+if (not is_local_host(PROXY_HOST) or is_wildcard_host(PROXY_HOST)) and PROXY_API_KEY == _DEFAULT_PROXY_API_KEY:
     source, source_label = _env_source("CX_CLIPROXY_API_KEY")
     CONFIG_ERRORS.append(ConfigError(
         f"PROXY_API_KEY from {source_label} must be changed when PROXY_HOST is not local.",
         source,
     ))
 
-if not is_local_host(ROUTER_HOST) and ROUTER_API_KEY == _DEFAULT_ROUTER_API_KEY:
+if (not is_local_host(ROUTER_HOST) or is_wildcard_host(ROUTER_HOST)) and ROUTER_API_KEY == _DEFAULT_ROUTER_API_KEY:
     source, source_label = _env_source("CX_ROUTER_API_KEY", "CX_LITELLM_API_KEY")
     CONFIG_ERRORS.append(ConfigError(
         f"ROUTER_API_KEY from {source_label} must be changed when ROUTER_HOST is not local.",

@@ -268,13 +268,23 @@ class ConfigErrorTests(unittest.TestCase):
         with _isolated_config(CX_CLIPROXY_HOST="192.0.2.10", CX_CLIPROXY_API_KEY="configured") as snapshot:
             self.assertEqual(snapshot["CONFIG_ERRORS"], [])
 
-    def test_wildcard_bind_hosts_need_no_key_under_the_single_locality_rule(self):
+    def test_wildcard_bind_hosts_require_explicit_keys(self):
         for host in ("0.0.0.0", "::"):
             with self.subTest(host=host), _isolated_config(
                 CX_CLIPROXY_HOST=host, CX_ROUTER_HOST=host
             ) as snapshot:
                 self.assertEqual(snapshot["PROXY_HOST"], host)
                 self.assertEqual(snapshot["ROUTER_HOST"], host)
+                self.assertEqual(len(snapshot["CONFIG_ERRORS"]), 2)
+                self.assertTrue(any("PROXY_API_KEY" in error for error in snapshot["CONFIG_ERRORS"]))
+                self.assertTrue(any("ROUTER_API_KEY" in error for error in snapshot["CONFIG_ERRORS"]))
+
+            with self.subTest(host=host, configured=True), _isolated_config(
+                CX_CLIPROXY_HOST=host,
+                CX_ROUTER_HOST=host,
+                CX_CLIPROXY_API_KEY="proxy-configured",
+                CX_ROUTER_API_KEY="router-configured",
+            ) as snapshot:
                 self.assertEqual(snapshot["CONFIG_ERRORS"], [])
 
     def test_valid_env_still_applies(self):

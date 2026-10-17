@@ -35,6 +35,14 @@ def is_local_host(host: str) -> bool:
         return False
 
 
+def is_wildcard_host(host: str) -> bool:
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(candidate).is_unspecified
+    except ValueError:
+        return False
+
+
 def open_http_url(request: Request, *, timeout: float) -> Any:
     if is_local_host(urlsplit(request.full_url).hostname or ""):
         return build_opener(ProxyHandler({})).open(request, timeout=timeout)

@@ -16,31 +16,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules.router import (
-    _CooldownTable,
-    _InFlight,
     _Member,
     _parse_pools,
-    _pick_member,
     _Pool,
     _PoolRegistry,
-    _RateLimiter,
     _retry_after_seconds,
     _rewrite_model,
-    _Rotation,
     _RouterServer,
+    _Scheduler,
     _upstream_headers,
 )
+from modules.router_state import RouterState
 
 _SSE = {"Content-Type": "text/event-stream"}
 _OK_BODY = b'{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'
 _START = b'event: message_start\ndata: {"type":"message_start"}\n\n'
 _DELTA = b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
 _STOP = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-
-
-def _rotate(pool: _Pool, cooldowns: _CooldownTable, rotation: _Rotation,
-            exclude: set[str] | None = None) -> _Member:
-    return _pick_member(pool, cooldowns, exclude or set(), None, rotation=rotation)
 
 
 def _mk_pool(*members: tuple[str, int, int], strategy: str = "fill-first") -> _Pool:
@@ -80,31 +72,56 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            state.request_started.set()
             return
         if status == 0:
             self.close_connection = True
             return
-        self.send_response(status)
-        for key, value in headers.items():
-            self.send_header(key, value)
-        if isinstance(body, bytes):
-            self.send_header("Content-Length", str(len(body)))
-        else:
+        state.request_started.set()
+        if response_delay := getattr(state, "response_delay", 0):
+            state.request_started.clear()
+            time.sleep(response_delay)
+            state.request_started.set()
+        if header_delay := getattr(state, "header_delay", 0):
             self.close_connection = True
-            self.send_header("Connection", "close")
-        self.end_headers()
+            lines = [f"HTTP/1.1 {status} OK\r\n"]
+            lines.extend(f"{key}: {value}\r\n" for key, value in headers.items())
+            if isinstance(body, bytes) and not any(key.lower() == "content-length" for key in headers):
+                lines.append(f"Content-Length: {len(body)}\r\n")
+            else:
+                lines.append("Connection: close\r\n")
+            for line in lines:
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+                time.sleep(header_delay)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+        else:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            if isinstance(body, bytes):
+                self.send_header("Content-Length", str(len(body)))
+            else:
+                self.close_connection = True
+                self.send_header("Connection", "close")
+            self.end_headers()
         if isinstance(body, bytes):
             self.wfile.write(body)
+            state.request_started.set()
             return
         self.wfile.write(body[0])
         self.wfile.flush()
         state.stream_gate.wait(timeout=1)
         for chunk in body[1:]:
+            if stream_delay := getattr(state, "stream_delay", 0):
+                time.sleep(stream_delay)
             if chunk == b"__drop__":
                 self.connection.close()
                 return
             self.wfile.write(chunk)
             self.wfile.flush()
+        state.request_started.set()
 
 
 @contextmanager
@@ -112,10 +129,12 @@ def _running_router(
     *responses: tuple[int, dict[str, str], bytes | tuple[bytes, ...]],
     members: list[dict[str, object]] | None = None,
     strategy: str = "fill-first",
+    persistent_state: bool = False,
 ):
     upstream = _FakeUpstreamServer(("127.0.0.1", 0), _UpstreamHandler)
     upstream.state = types.SimpleNamespace(
-        responses=deque(responses), models=[], paths=[], stream_gate=threading.Event())
+        responses=deque(responses), models=[], paths=[], stream_gate=threading.Event(),
+        request_started=threading.Event(), stream_delay=0, response_delay=0, header_delay=0)
     upstream_thread = threading.Thread(
         target=upstream.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )
@@ -148,7 +167,8 @@ def _running_router(
             patch("modules.router.PROXY_PORT", upstream.server_port),
             patch("modules.router.ROUTER_API_KEY", "test-router-key"),
         ):
-            router = _RouterServer(("127.0.0.1", 0))
+            state_path = pools_file.with_name("router-state.json") if persistent_state else None
+            router = _RouterServer(("127.0.0.1", 0), state_path=state_path)
             router.pools = _PoolRegistry(pools_file)
             router.upstream_state = upstream.state
             router_thread = threading.Thread(
@@ -221,170 +241,98 @@ class ParsePoolsTests(unittest.TestCase):
         self.assertEqual(_parse_pools(bad)["p"].strategy, "fill-first")
 
 
-class PickMemberTests(unittest.TestCase):
-    def test_strict_priority_tier(self) -> None:
-        pool = _mk_pool(("a", 100, 2), ("b", 1, 1))
-        cd = _CooldownTable()
-        for _ in range(20):
-            self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "b")
-
-    def test_falls_to_next_tier_when_top_excluded(self) -> None:
-        pool = _mk_pool(("a", 1, 1), ("b", 1, 2))
-        cd = _CooldownTable()
-        self.assertEqual(_pick_member(pool, cd, exclude={"a"}).model, "b")
-
-    def test_falls_to_next_tier_when_top_in_cooldown(self) -> None:
-        pool = _mk_pool(("a", 1, 1), ("b", 1, 2))
-        cd = _CooldownTable()
-        cd.cooldown("a", 30, "test")
-        self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "b")
-
-    def test_all_cooling_remains_selectable(self) -> None:
-        pool = _mk_pool(("a", 1, 1))
-        cd = _CooldownTable()
-        cd.cooldown("a", 30, "test")
-        self.assertEqual(_pick_member(pool, cd, exclude=set()).model, "a")
-
-    def test_rpm_weight_within_tier(self) -> None:
-        pool = _mk_pool(("heavy", 999, 0), ("light", 1, 0))
-        cd = _CooldownTable()
-        counts = {"heavy": 0, "light": 0}
-        for _ in range(400):
-            m = _pick_member(pool, cd, exclude=set())
-            counts[m.model] += 1
-        self.assertGreater(counts["heavy"], counts["light"] * 20)
+def _pick(scheduler: _Scheduler, pool: _Pool, tried: set[str] | None = None):
+    with scheduler.hold(pool, tried or set()) as member:
+        return member.model if member is not None else None
 
 
-class RoundRobinTests(unittest.TestCase):
-    def test_rotates_evenly_ignoring_tiers_and_weights(self) -> None:
-        pool = _mk_pool(("a", 1, 2), ("b", 999, 1), ("c", 1, 0), strategy="round-robin")
-        cd, rotation = _CooldownTable(), _Rotation()
-        picks = [_rotate(pool, cd, rotation).model for _ in range(6)]
-        self.assertEqual(picks, ["a", "b", "c", "a", "b", "c"])
+class SelectionTests(unittest.TestCase):
+    def test_fill_first_drains_priority_before_weight(self):
+        scheduler = _Scheduler(RouterState())
+        pool = _mk_pool(("low", 999, 2), ("top", 1, 0))
+        self.assertEqual([_pick(scheduler, pool) for _ in range(10)], ["top"] * 10)
+        self.assertEqual(_pick(scheduler, pool, {"top"}), "low")
+        scheduler.state.cooldown("top", 30)
+        self.assertEqual(_pick(scheduler, pool), "low")
 
-    def test_skips_cooling_member_in_rotation(self) -> None:
-        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="round-robin")
-        cd, rotation = _CooldownTable(), _Rotation()
-        cd.cooldown("a", 30, "test")
-        picks = [_rotate(pool, cd, rotation).model for _ in range(3)]
-        self.assertEqual(picks, ["b", "b", "b"])
+    def test_every_strategy_can_retry_cooling_members(self):
+        for strategy in ("round-robin", "fill-first", "weighted", "least-busy"):
+            with self.subTest(strategy=strategy):
+                scheduler = _Scheduler(RouterState())
+                pool = _mk_pool(("a", 1, 0), ("b", 1, 1), strategy=strategy)
+                scheduler.state.cooldown("a", 30)
+                scheduler.state.cooldown("b", 30)
+                first = _pick(scheduler, pool)
+                self.assertIn(first, {"a", "b"})
+                self.assertEqual(_pick(scheduler, pool, {first}), ({"a", "b"} - {first}).pop())
 
-    def test_all_cooling_still_rotates(self) -> None:
-        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="round-robin")
-        cd, rotation = _CooldownTable(), _Rotation()
-        cd.cooldown("a", 30, "test")
-        cd.cooldown("b", 30, "test")
-        picks = [_rotate(pool, cd, rotation).model for _ in range(4)]
-        self.assertEqual(picks, ["a", "b", "a", "b"])
+    def test_capped_ready_members_do_not_hide_cooling_capacity(self):
+        for strategy in ("round-robin", "fill-first", "weighted", "least-busy"):
+            scheduler = _Scheduler(RouterState())
+            pool = _Pool("p", (_Member("a", 1, 0, 1), _Member("b", 1, 1, 1)), strategy)
+            scheduler.state.reserve("a", 1)
+            scheduler.state.cooldown("b", 30)
+            self.assertEqual(_pick(scheduler, pool), "b")
+            self.assertIsNone(_pick(scheduler, pool))
 
-    def test_retry_does_not_replay_on_the_next_request(self) -> None:
+    def test_round_robin_advances_once_per_request(self):
+        scheduler = _Scheduler(RouterState())
         pool = _mk_pool(("a", 1, 0), ("b", 1, 0), ("c", 1, 0), strategy="round-robin")
-        cd, rotation = _CooldownTable(), _Rotation()
-        first = _rotate(pool, cd, rotation)
-        retry = _rotate(pool, cd, rotation, exclude={first.model})
-        following = [_rotate(pool, cd, rotation).model for _ in range(3)]
-        self.assertEqual([first.model, retry.model], ["a", "b"])
-        self.assertEqual(following, ["c", "a", "b"])
+        self.assertEqual(_pick(scheduler, pool), "a")
+        self.assertEqual(_pick(scheduler, pool, {"a"}), "b")
+        self.assertEqual([_pick(scheduler, pool) for _ in range(3)], ["b", "c", "a"])
 
-    def test_cooling_member_reclaims_its_own_slot(self) -> None:
+    def test_round_robin_skips_and_restores_cooling_member(self):
+        scheduler = _Scheduler(RouterState())
         pool = _mk_pool(("a", 1, 0), ("b", 1, 0), ("c", 1, 0), strategy="round-robin")
-        cd, rotation = _CooldownTable(), _Rotation()
-        cd.cooldown("b", 30, "test")
-        self.assertEqual([_rotate(pool, cd, rotation).model for _ in range(4)],
-                         ["a", "c", "a", "c"])
-        cd.clear("b")
-        self.assertEqual([_rotate(pool, cd, rotation).model for _ in range(3)],
-                         ["a", "b", "c"])
+        scheduler.state.cooldown("b", 30)
+        self.assertEqual([_pick(scheduler, pool) for _ in range(4)], ["a", "c", "a", "c"])
+        scheduler.state.clear("b")
+        self.assertEqual([_pick(scheduler, pool) for _ in range(3)], ["a", "b", "c"])
 
-    def test_cursor_resets_when_member_count_changes(self) -> None:
-        rotation = _Rotation()
-        self.assertEqual(rotation.reserve("p", 3, lambda cursor: cursor), 0)
-        self.assertEqual(rotation.reserve("p", 3, lambda cursor: cursor), 1)
-        self.assertEqual(rotation.reserve("p", 2, lambda cursor: cursor), 0)
-        self.assertEqual(rotation.cursor("p", 2), 1)
+    def test_configuration_reorder_resets_the_cursor(self):
+        scheduler = _Scheduler(RouterState())
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="round-robin")
+        self.assertEqual(_pick(scheduler, pool), "a")
+        reordered = _Pool(pool.name, tuple(reversed(pool.members)), pool.strategy)
+        self.assertEqual(_pick(scheduler, reordered), "b")
 
+    def test_quota_expires_against_the_clock(self):
+        clock = [0.0]
+        scheduler = _Scheduler(RouterState(monotonic_time=lambda: clock[0]))
+        pool = _Pool("p", (_Member("a", 1, 0, 1),))
+        self.assertEqual(_pick(scheduler, pool), "a")
+        self.assertIsNone(_pick(scheduler, pool))
+        clock[0] = 61
+        self.assertEqual(_pick(scheduler, pool), "a")
 
-def _mk_pool_limited(*members: tuple[str, int, int, int | None],
-                     strategy: str = "fill-first") -> _Pool:
-    return _Pool(
-        name="p",
-        members=tuple(
-            _Member(model=m, rpm=r, priority=p, limit=lim)
-            for m, r, p, lim in members
-        ),
-        strategy=strategy,
-    )
+    def test_concurrent_requests_cannot_overrun_quota(self):
+        scheduler = _Scheduler(RouterState())
+        pool = _Pool("p", (_Member("a", 1, 0, 1),))
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            picks = list(executor.map(lambda _: _pick(scheduler, pool), range(16)))
+        self.assertEqual(picks.count("a"), 1)
+        self.assertEqual(picks.count(None), 15)
 
+    def test_least_busy_reserves_load_with_selection_and_releases_on_error(self):
+        scheduler = _Scheduler(RouterState())
+        pool = _mk_pool(("a", 1, 0), ("b", 1, 9), strategy="least-busy")
+        with scheduler.hold(pool, set()) as first:
+            self.assertEqual(scheduler.count(first.model), 1)
+            self.assertEqual(_pick(scheduler, pool), ({"a", "b"} - {first.model}).pop())
+        self.assertEqual(scheduler.count(first.model), 0)
+        with self.assertRaises(RuntimeError), scheduler.hold(pool, set()):
+            raise RuntimeError("probe")
+        self.assertEqual(sum(scheduler.count(m.model) for m in pool.members), 0)
 
-class PacingTests(unittest.TestCase):
-    def test_unpaced_member_is_not_limited(self) -> None:
-        pool = _mk_pool_limited(("a", 1, 1, None), ("b", 1, 2, None))
-        cd = _CooldownTable()
-        lim = _RateLimiter()
-        for _ in range(150):
-            _pick_member(pool, cd, exclude=set(), limiter=lim)
-        self.assertEqual(cd.is_ready("a"), True)
-        self.assertEqual(
-            _pick_member(pool, cd, exclude=set(), limiter=lim).model, "a"
-        )
-
-    def test_paced_top_member_spills_to_next_tier(self) -> None:
-        pool = _mk_pool_limited(("fast", 1, 1, 2), ("slow", 1, 2, None))
-        cd = _CooldownTable()
-        lim = _RateLimiter()
-        chosen: list[str] = []
-        for _ in range(6):
-            m = _pick_member(pool, cd, exclude=set(), limiter=lim)
-            chosen.append(m.model)
-        self.assertEqual(chosen[:2], ["fast", "fast"])
-        self.assertIn("slow", chosen[2:])
-        self.assertNotIn("fast", chosen[2:])
-
-    def test_all_paced_out_does_not_dispatch_over_limit(self) -> None:
-        pool = _mk_pool_limited(("a", 1, 1, 1), ("b", 1, 2, 1))
-        cd = _CooldownTable()
-        lim = _RateLimiter()
-        self.assertTrue(lim.reserve("a", 1))
-        self.assertTrue(lim.reserve("b", 1))
-        self.assertIsNone(_pick_member(pool, cd, exclude=set(), limiter=lim))
-
-    def test_round_robin_all_paced_out_does_not_wrap_over_limit(self) -> None:
-        pool = _mk_pool_limited(("a", 1, 0, 1), ("b", 1, 0, 1), strategy="round-robin")
-        cd, lim, rotation = _CooldownTable(), _RateLimiter(), _Rotation()
-        picked = [
-            _pick_member(pool, cd, exclude=set(), limiter=lim, rotation=rotation)
-            for _ in range(2)
-        ]
-        self.assertEqual([member.model for member in picked], ["a", "b"])
-        for _ in range(2):
-            self.assertIsNone(
-                _pick_member(pool, cd, exclude=set(), limiter=lim, rotation=rotation)
-            )
-
-    def test_window_expiry_restores_capacity(self) -> None:
-        pool = _mk_pool_limited(("fast", 1, 1, 1), ("slow", 1, 2, None))
-        cd = _CooldownTable()
-        lim = _RateLimiter()
-        self.assertTrue(lim.reserve("fast", 1))
-        self.assertEqual(
-            _pick_member(pool, cd, exclude=set(), limiter=lim).model, "slow"
-        )
-        with patch("modules.router._now", return_value=time.monotonic() + 120.0):
-            self.assertEqual(
-                _pick_member(pool, cd, exclude=set(), limiter=lim).model, "fast"
-            )
-
-    def test_concurrent_reservations_accept_exact_limit(self) -> None:
-        pool = _mk_pool_limited(("member", 1, 0, 1))
-        cd, lim, barrier = _CooldownTable(), _RateLimiter(), threading.Barrier(2)
-
-        def choose() -> bool:
-            barrier.wait()
-            return _pick_member(pool, cd, exclude=set(), limiter=lim) is not None
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            accepted = list(executor.map(lambda _: choose(), range(2)))
-        self.assertEqual(sum(accepted), 1)
+    def test_weighted_selection_ignores_priority_and_handles_large_weights(self):
+        import random
+        scheduler = _Scheduler(RouterState())
+        pool = _mk_pool(("a", 2**63 - 1, 0), ("b", 2**63 - 1, 9), strategy="weighted")
+        with patch("modules.router.random.random", side_effect=random.Random(123).random):
+            picks = [_pick(scheduler, pool) for _ in range(100)]
+        self.assertGreater(picks.count("a"), 20)
+        self.assertGreater(picks.count("b"), 20)
 
 
 class ModelRewriteTests(unittest.TestCase):
@@ -434,6 +382,48 @@ class RetryAfterTests(unittest.TestCase):
 
 
 class PoolFailoverTests(unittest.TestCase):
+    def test_dispatch_limit_preserves_health_and_authentication(self) -> None:
+        with patch("modules.router._MAX_ACTIVE_REQUESTS", 1), _running_router(
+            (200, _SSE, (_START, _DELTA, _STOP)),
+        ) as router:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(_post, router)
+                self.assertTrue(router.upstream_state.request_started.wait(2))
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=5)
+                    connection.request("GET", "/health")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                    connection.close()
+                    connection = http.client.HTTPConnection("127.0.0.1", router.server_port, timeout=5)
+                    connection.request("POST", "/v1/messages", body=b"{}")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 401)
+                    response.read()
+                    connection.close()
+                    status, body = _post(router)
+                finally:
+                    router.upstream_state.stream_gate.set()
+                first_status, first_body = first.result(timeout=5)
+
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"]["message"], "router: capacity exhausted")
+        self.assertEqual((first_status, first_body), (200, _START + _DELTA + _STOP))
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
+
+    def test_snapshot_write_failure_does_not_prevent_upstream_dispatch(self) -> None:
+        with patch("modules.router_state._publish_state", side_effect=OSError("disk full")):
+            with _running_router(
+                (200, {}, _OK_BODY),
+                members=[{"model": "provider/first", "rpm": 1, "priority": 1}],
+                persistent_state=True,
+            ) as router:
+                status, body = _post(router)
+
+        self.assertEqual((status, body), (200, _OK_BODY))
+        self.assertEqual(router.upstream_state.models, ["provider/first"])
+
     def test_a_rejected_attempt_fails_over_to_the_next_member(self) -> None:
         cases = (
             ("auth_401", (401, {}, b'{"error":{"message":"API Key error"}}')),
@@ -443,6 +433,7 @@ class PoolFailoverTests(unittest.TestCase):
             ("transient_408", (408, {}, b'{"error":{"message":"transient"}}')),
             ("transient_409", (409, {}, b'{"error":{"message":"transient"}}')),
             ("transient_425", (425, {}, b'{"error":{"message":"transient"}}')),
+            ("missing_route_404", (404, {}, b'{"error":{"message":"model not found"}}')),
         )
         for label, rejected in cases:
             with self.subTest(rejection=label), _running_router(
@@ -480,35 +471,21 @@ class PoolFailoverTests(unittest.TestCase):
                 ["provider/first", "provider/second"],
             )
 
-    def test_a_400_from_one_member_fails_over_to_the_next(self) -> None:
-        rejection = b'{"error":{"message":"Failed to deserialize the JSON body into the target type"}}'
-        with _running_router((400, {}, rejection), (200, {}, _OK_BODY)) as router:
-            status, body = _post(router)
-
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
-
-    def test_a_4xx_the_whole_pool_refuses_is_reported_as_exhausted(self) -> None:
-        for status_code in (400, 404, 422):
+    def test_terminal_pool_4xx_is_forwarded_without_failover_or_cooldown(self) -> None:
+        for status_code in (400, 422):
             with self.subTest(status=status_code):
-                # Two sweeps over two members, so four refusals before the pool
-                # gives up; fewer and the fixture would answer the last attempt
-                # with its own default rather than the status under test.
-                refusal = (status_code, {}, b'{"error":{"message":"arbitrary rejection"}}')
-                with _running_router(*[refusal] * 4) as router:
+                body = b'{"error":{"message":"arbitrary rejection"}}'
+                with _running_router(
+                    (status_code, {"X-Provider-Error": "request-rejected"}, body),
+                    (200, {}, _OK_BODY),
+                ) as router:
                     status, body = _post(router)
 
-                self.assertEqual(status, 503)
-                error = json.loads(body)["error"]
-                self.assertEqual(error["type"], "pool_exhausted")
-                self.assertEqual(
-                    {failure["status"] for failure in error["attempts"]}, {status_code})
-                self.assertEqual(len(error["attempts"]), 4)
-                self.assertCountEqual(
-                    router.upstream_state.models, ["provider/first", "provider/second"] * 2)
-                self.assertFalse(router.cooldowns.is_ready("provider/first"))
-                self.assertFalse(router.cooldowns.is_ready("provider/second"))
+                self.assertEqual(status, status_code)
+                self.assertEqual(body, b'{"error":{"message":"arbitrary rejection"}}')
+                self.assertEqual(router.upstream_state.models, ["provider/first"])
+                self.assertTrue(router.runtime_state.is_ready("provider/first"))
+                self.assertTrue(router.runtime_state.is_ready("provider/second"))
 
     def test_pooled_failure_does_not_log_provider_body(self) -> None:
         provider_secret = b"provider-body-secret"
@@ -521,6 +498,19 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(status, 200)
         output = "\n".join(logs.output)
         self.assertNotIn(provider_secret.decode(), output)
+
+    def test_direct_failure_logs_path_without_query(self) -> None:
+        query_secret = "query-secret-7f93"
+        with self.assertLogs("cx.router", level="DEBUG") as logs:
+            with _running_router(
+                (500, {}, b'{"error":{"message":"provider failed"}}'),
+            ) as router:
+                status, _ = _post(router, f"/v1/completions?token={query_secret}", model="provider/direct")
+
+        self.assertEqual(status, 500)
+        output = "\n".join(logs.output)
+        self.assertNotIn(query_secret, output)
+        self.assertIn("/v1/completions", output)
 
     def test_count_tokens_rate_limit_tries_next_member(self) -> None:
         with _running_router(
@@ -575,6 +565,22 @@ class PoolFailoverTests(unittest.TestCase):
         self.assertEqual(rest, _STOP)
         self.assertEqual(router.upstream_state.models, ["provider/first"])
 
+    def test_stream_is_stopped_at_the_whole_request_deadline(self) -> None:
+        final_delta = (
+            b'event: content_block_delta\ndata: '
+            b'{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"final"}}\n\n'
+        )
+        chunks = (_START, _DELTA, *([_DELTA] * 8), final_delta, _STOP)
+        with _running_router((200, _SSE, chunks)) as router:
+            router.upstream_state.stream_gate.set()
+            router.upstream_state.stream_delay = 0.01
+            with patch("modules.router._POOL_REQUEST_TIMEOUT", 0.08):
+                status, body = _post(router)
+
+        self.assertEqual(status, 200)
+        self.assertNotIn(b'"text":"final"', body)
+        self.assertIn(b"upstream stream interrupted", body)
+
     def test_empty_responses_try_the_next_member(self) -> None:
         empties = (
             (_SSE, b""),
@@ -604,8 +610,8 @@ class PoolFailoverTests(unittest.TestCase):
         with _running_router((200, {}, b'{"content":[]}'), (200, {}, _OK_BODY)) as router:
             status, _ = _post(router)
             self.assertEqual(status, 200)
-            self.assertFalse(router.cooldowns.is_ready("provider/first"))
-            self.assertTrue(router.cooldowns.is_ready("provider/second"))
+            self.assertFalse(router.runtime_state.is_ready("provider/first"))
+            self.assertTrue(router.runtime_state.is_ready("provider/second"))
 
     def test_count_tokens_body_without_content_is_not_empty(self) -> None:
         with _running_router((200, {}, b'{"input_tokens":5}')) as router:
@@ -712,10 +718,10 @@ class PoolFailoverTests(unittest.TestCase):
             self.assertEqual(first_status, 200)
             self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
 
-            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+            self.assertFalse(router.runtime_state.is_ready("provider/first"))
 
             with patch("modules.router._now", return_value=time.monotonic() + 30.0):
-                self.assertTrue(router.cooldowns.is_ready("provider/first"))
+                self.assertTrue(router.runtime_state.is_ready("provider/first"))
 
     def test_provider_retry_after_overrides_paced_cooldown(self) -> None:
         members = [
@@ -729,9 +735,9 @@ class PoolFailoverTests(unittest.TestCase):
         ) as router:
             status, _ = _post(router)
             self.assertEqual(status, 200)
-            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+            self.assertFalse(router.runtime_state.is_ready("provider/first"))
             with patch("modules.router._now", return_value=time.monotonic() + 1.0):
-                self.assertFalse(router.cooldowns.is_ready("provider/first"))
+                self.assertFalse(router.runtime_state.is_ready("provider/first"))
 
 
 _R_CREATED = b'event: response.created\ndata: {"type":"response.created"}\n\n'
@@ -807,71 +813,6 @@ class MultiFormatPoolTests(unittest.TestCase):
                     self.assertEqual(_post(router, path)[0], 200)
                 self.assertEqual(router.upstream_state.paths, [path])
                 self.assertEqual(router.upstream_state.models, ["provider/first"])
-
-
-class WeightedStrategyTests(unittest.TestCase):
-    def test_ignores_priority_tiers(self) -> None:
-        pool = _mk_pool(("a", 1, 0), ("b", 1, 9), strategy="weighted")
-        picks = {_pick_member(pool, _CooldownTable(), set()).model for _ in range(60)}
-        self.assertEqual(picks, {"a", "b"})
-
-    def test_rpm_biases_the_draw(self) -> None:
-        pool = _mk_pool(("heavy", 99, 0), ("light", 1, 0), strategy="weighted")
-        cooldowns = _CooldownTable()
-        picks = [_pick_member(pool, cooldowns, set()).model for _ in range(200)]
-        self.assertGreater(picks.count("heavy"), picks.count("light"))
-
-
-class LeastBusyStrategyTests(unittest.TestCase):
-    def test_prefers_the_idle_member(self) -> None:
-        pool = _mk_pool(("busy", 1, 0), ("idle", 1, 0), strategy="least-busy")
-        inflight = _InFlight()
-        with inflight.hold("busy"):
-            picks = {_pick_member(pool, _CooldownTable(), set(), inflight=inflight).model
-                     for _ in range(30)}
-        self.assertEqual(picks, {"idle"})
-
-    def test_ignores_priority_tiers_when_the_top_tier_is_loaded(self) -> None:
-        pool = _mk_pool(("top", 1, 0), ("low", 1, 9), strategy="least-busy")
-        inflight = _InFlight()
-        with inflight.hold("top"):
-            self.assertEqual(
-                _pick_member(pool, _CooldownTable(), set(), inflight=inflight).model, "low")
-
-    def test_all_idle_spreads_across_members(self) -> None:
-        pool = _mk_pool(("a", 1, 0), ("b", 1, 0), strategy="least-busy")
-        inflight = _InFlight()
-        picks = {_pick_member(pool, _CooldownTable(), set(), inflight=inflight).model
-                 for _ in range(60)}
-        self.assertEqual(picks, {"a", "b"})
-
-    def test_hold_releases_the_slot(self) -> None:
-        inflight = _InFlight()
-        with inflight.hold("m"):
-            self.assertEqual(inflight.count("m"), 1)
-        self.assertEqual(inflight.count("m"), 0)
-
-    def test_hold_releases_on_exception(self) -> None:
-        inflight = _InFlight()
-        with self.assertRaises(RuntimeError), inflight.hold("m"):
-            raise RuntimeError("boom")
-        self.assertEqual(inflight.count("m"), 0)
-
-    def test_dispatch_releases_the_slot_after_the_response(self) -> None:
-        with _running_router((200, {}, _OK_BODY)) as router:
-            released = threading.Event()
-            original_hold = router.inflight.hold
-
-            @contextmanager
-            def hold(model: str):
-                with original_hold(model):
-                    yield
-                released.set()
-
-            router.inflight.hold = hold
-            self.assertEqual(_post(router)[0], 200)
-            self.assertTrue(released.wait(timeout=5))
-            self.assertEqual(router.inflight.count("provider/first"), 0)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import http.server
 import os
 import shutil
 import signal
@@ -11,13 +12,11 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 from unittest.mock import MagicMock, patch
 
-from modules import models, proxy
+from modules import models, process, proxy
 from modules.models import Model
 
 _MODELS_SERVER = """
@@ -79,31 +78,11 @@ while True:
 _SLEEPER = "import time\nwhile True:\n    time.sleep(0.05)\n"
 
 
-
 def _stub_executable(directory: Path, body: str) -> Path:
     path = directory / "cli-proxy-api"
     path.write_text(f"#!{sys.executable}\n{body}", encoding="ascii")
     path.chmod(0o755)
     return path
-
-
-def _executable_alias(directory: Path, name: str = "cli-proxy-api") -> Path:
-    path = directory / name
-    path.symlink_to(os.path.realpath(sys.executable))
-    return path
-
-
-def _unvenved() -> dict[str, str]:
-    """An environment in which a copy of the interpreter, moved aside, starts.
-
-    VIRTUAL_ENV names a pyvenv.cfg the copy cannot see, and a CPython that finds
-    the variable without the file exits before running any code. PYTHONHOME names
-    the tree to load the standard library from, which a copy outside that tree
-    can no longer find by walking up from where it sits.
-    """
-    environment = {name: value for name, value in os.environ.items() if name.upper() != "VIRTUAL_ENV"}
-    environment["PYTHONHOME"] = sys.base_prefix
-    return environment
 
 
 def _executable_copy(directory: Path, name: str) -> Path:
@@ -135,25 +114,6 @@ def _executable_copy(directory: Path, name: str) -> Path:
             encoding="utf-8",
         )
     path.chmod(0o755)
-    return path
-
-
-def _foreign_binary_alias(directory: Path, name: str) -> Path:
-    other = shutil.which("dash") or shutil.which("sh")
-    if other is None:
-        raise AssertionError("no second system binary to build a decoy from")
-    path = directory / name
-    path.symlink_to(other)
-    return path
-
-
-def _foreign_binary(directory: Path, name: str) -> Path:
-    """A decoy that is only ever compared against, never spawned.
-
-    An empty file says as much as a symlink would, and needs no symlink privilege.
-    """
-    path = directory / name
-    path.touch()
     return path
 
 
@@ -219,36 +179,6 @@ def _processes_running(path: Path) -> list[str]:
 _CLOCK_SLACK = 0.05
 
 
-def _wait_for_port(
-    port: int,
-    timeout: float = 30.0,
-    child: subprocess.Popen[bytes] | None = None,
-) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with socket.socket() as probe:
-            probe.settimeout(0.2)
-            if probe.connect_ex(("127.0.0.1", port)) == 0:
-                return
-        if child is not None and child.poll() is not None:
-            raise AssertionError(
-                f"the child exited with {child.returncode} before port {port} was listening"
-                + _child_complaint(child.stderr))
-        time.sleep(0.05)
-    raise AssertionError(f"port {port} never started listening within {timeout:.0f}s")
-
-
-def _child_complaint(stderr: Any) -> str:
-    """Whatever the child managed to say, which is the only clue to why it died."""
-    if stderr is None:
-        return ""
-    try:
-        text = stderr.read()
-    except (OSError, ValueError):
-        return ""
-    return f"\nchild stderr:\n{text.decode(errors='replace')[-2000:]}" if text else ""
-
-
 class FakeProcess:
     def __init__(self, pid: int = 43210) -> None:
         self.pid = pid
@@ -281,6 +211,9 @@ class UnstoppableProcess(FakeProcess):
 
 
 class ProxyLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(patch.object(proxy, "fetch_upstream_models", side_effect=RuntimeError("no test listener")))
+
     def test_concurrent_ensure_proxy_spawns_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -337,122 +270,15 @@ class ProxyLifecycleTests(unittest.TestCase):
             self.assertEqual(spawn.call_count, 1)
             self.assertEqual(pid.read_text(encoding="ascii"), "43210")
 
-    def test_pid_identity_uses_lsof_on_macos(self):
-        result = SimpleNamespace(returncode=0, stdout="p123\nn/srv/cli proxy api\n")
-        with patch.object(proxy, "_pid_is_alive", return_value=True), \
-             patch.object(proxy, "PROXY_EXE", Path("/srv/cli proxy api")), \
-             patch.object(proxy.sys, "platform", "darwin"), \
-             patch.object(Path, "read_bytes", side_effect=AssertionError("proc used")), \
-             patch.object(proxy.subprocess, "run", return_value=result):
-            self.assertTrue(proxy._pid_is_proxy(123))
-
-    def test_ps_fallback_handles_paths_with_spaces(self):
-        result = SimpleNamespace(returncode=0, stdout="/srv/cli proxy api --config config.yaml\n")
-        with patch.object(proxy, "_pid_is_alive", return_value=True), \
-             patch.object(proxy, "PROXY_EXE", Path("/srv/cli proxy api")), \
-             patch.object(proxy.sys, "platform", "linux"), \
-             patch.object(Path, "read_bytes", side_effect=OSError("proc unavailable")), \
-             patch.object(proxy.subprocess, "run", return_value=result):
-            self.assertTrue(proxy._pid_is_proxy(123))
-
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "a live pid is identified through /proc"
-    )
-    def test_live_pid_identity_handles_spaces_and_same_basename(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            configured_dir = root / "configured dir"
-            other_dir = root / "other dir"
-            configured_dir.mkdir()
-            other_dir.mkdir()
-            configured = configured_dir / "python proxy"
-            other = other_dir / "python proxy"
-            configured.symlink_to(os.path.realpath(sys.executable))
-            _executable_copy(other_dir, "python proxy")
-            process = subprocess.Popen([str(configured), "-c", "import time; time.sleep(30)"])
-            try:
-                with patch.object(proxy.sys, "platform", "linux"), \
-                     patch.object(proxy, "PROXY_EXE", configured):
-                    self.assertTrue(proxy._pid_is_proxy(process.pid))
-                    with patch.object(proxy, "PROXY_EXE", other):
-                        self.assertFalse(proxy._pid_is_proxy(process.pid))
-            finally:
-                process.terminate()
-                process.wait(timeout=3)
-
-    def test_windows_pid_identity_checks_the_executable_field(self):
-        result = SimpleNamespace(
-            returncode=0,
-            stdout='cli-proxy-api.exe\n"C:\\Program Files\\cli-proxy-api.exe" --config config.yaml\n',
-        )
-        with patch.object(proxy, "_pid_is_alive", return_value=True), \
-             patch.object(proxy, "PROXY_EXE", Path(r"C:\Program Files\cli-proxy-api.exe")), \
-             patch.object(proxy.sys, "platform", "win32"), \
-             patch.object(proxy.subprocess, "run", return_value=result), \
-             patch.object(proxy.subprocess, "CREATE_NO_WINDOW", 0, create=True), \
-             patch.object(proxy.subprocess, "CREATE_NEW_PROCESS_GROUP", 0, create=True):
-            self.assertTrue(proxy._pid_is_proxy(123))
-
-    def test_identity_helper_timeouts_are_reported_separately(self):
-        def timeout_run(result):
-            def run(command, **kwargs):
-                timeout = kwargs.get("timeout")
-                if timeout is None:
-                    return result
-                raise subprocess.TimeoutExpired(command, timeout)
-
-            return run
-
-        cases = (
-            (
-                "tasklist",
-                "win32",
-                nullcontext(),
-                SimpleNamespace(returncode=0, stdout='"123"\n'),
-            ),
-            (
-                "PowerShell",
-                "win32",
-                patch.object(proxy, "_pid_is_alive", return_value=True),
-                SimpleNamespace(
-                    returncode=0,
-                    stdout='cli-proxy-api.exe\n"C:\\cli-proxy-api.exe" --config config.yaml\n',
-                ),
-            ),
-            (
-                "ps",
-                "freebsd",
-                patch.object(proxy, "_pid_is_alive", return_value=True),
-                SimpleNamespace(returncode=0, stdout="/srv/cli-proxy-api --config config.yaml\n"),
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            log = Path(directory) / "proxy.log"
-            for helper, platform, alive_patch, result in cases:
-                with self.subTest(helper=helper), \
-                     patch.object(proxy, "PROXY_START_TIMEOUT", 0.01), \
-                     patch.object(proxy, "PROXY_LOG", log), \
-                     patch.object(proxy, "_read_pid", return_value=123), \
-                     patch.object(proxy, "PROXY_EXE", Path("/srv/cli-proxy-api")), \
-                     patch.object(proxy.sys, "platform", platform), \
-                     alive_patch, \
-                     patch.object(proxy.subprocess, "run", side_effect=timeout_run(result)), \
-                     patch.object(proxy.subprocess, "CREATE_NO_WINDOW", 0, create=True), \
-                     patch.object(proxy.subprocess, "CREATE_NEW_PROCESS_GROUP", 0, create=True):
-                    with self.assertRaises(RuntimeError) as caught:
-                        proxy.proxy_is_ready()
-                    self.assertRegex(str(caught.exception), f"{helper} timed out")
-                    self.assertIn(str(log), str(caught.exception))
 
     def test_positive_readiness_accepts_an_empty_model_list(self):
         with patch.object(proxy, "_read_pid", return_value=123), \
-             patch.object(proxy, "_pid_is_proxy", return_value=True), \
              patch.object(proxy, "fetch_upstream_models", return_value=[]):
             self.assertTrue(proxy.proxy_is_ready())
 
     def test_oversized_pid_is_invalid_without_os_error(self):
         with patch.object(proxy.os, "kill", side_effect=OverflowError("pid too large")) as kill:
-            self.assertFalse(proxy._pid_is_alive(2**63))
+            self.assertFalse(process.pid_is_alive(2**63, 2))
             kill.assert_not_called()
 
     def test_a_zombie_that_never_exits_is_not_a_live_listener(self):
@@ -463,7 +289,7 @@ class ProxyLifecycleTests(unittest.TestCase):
             os._exit(0)
         self.addCleanup(os.waitpid, child, 0)
         self.assertTrue(_became_zombie(child), "the unreaped child never became a zombie")
-        self.assertFalse(proxy._pid_is_alive(child, time.monotonic() + 2))
+        self.assertFalse(process.pid_is_alive(child, 2))
 
     def test_a_lock_failure_is_not_read_as_a_second_launcher(self):
         if sys.platform == "win32":
@@ -514,8 +340,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                  patch.object(proxy, "proxy_is_ready", side_effect=lambda deadline: next(ready_results)), \
                  patch.object(proxy, "_port_is_open", return_value=True), \
                  patch.object(proxy, "_read_pid", return_value=123), \
-                 patch.object(proxy, "_pid_is_proxy", return_value=True), \
-                 patch.object(proxy, "fetch_upstream_models", side_effect=AssertionError("single probe")), \
+                     patch.object(proxy, "fetch_upstream_models", side_effect=AssertionError("single probe")), \
                  patch.object(proxy.time, "sleep", return_value=None):
                 self.assertIsNone(proxy.ensure_proxy())
 
@@ -672,11 +497,6 @@ class ProxyLifecycleTests(unittest.TestCase):
             self.assertTrue(process.killed)
             self.assertFalse(pid.exists())
 
-    def test_readiness_requires_verified_proxy_process(self):
-        with patch.object(proxy, "_read_pid", return_value=123), \
-             patch.object(proxy, "_pid_is_proxy", return_value=False), \
-             patch.object(proxy, "fetch_upstream_models", return_value=[Model("m", "provider")]):
-            self.assertFalse(proxy.proxy_is_ready())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "stray children are spotted through /proc")
     def test_sigint_inside_the_popen_window_leaves_no_running_child(self):
@@ -719,170 +539,19 @@ class ProxyLifecycleTests(unittest.TestCase):
             self.addCleanup(self._kill_strays, exe)
             return strays
 
-    def _assert_listener_is_refused_and_left_running(self, exe: Path, port: int, pid_file: Path) -> None:
-        """A listener we cannot attribute to our own process is reported and the
-        port is left as found, so the next launch can still claim it."""
-        with patch.object(proxy, "PROXY_EXE", exe), \
-             patch.object(proxy, "PROXY_CONFIG", exe.parent / "missing.yaml"), \
-             patch.object(proxy, "PROXY_LOG", exe.parent / "proxy.log"), \
-             patch.object(proxy, "PROXY_PID", pid_file), \
-             patch.object(proxy, "PROXY_HOST", "127.0.0.1"), \
-             patch.object(proxy, "PROXY_PORT", port), \
-             patch.object(proxy, "PROXY_START_TIMEOUT", 30.0), \
-             patch.object(models, "PROXY_HOST", "127.0.0.1"), \
-             patch.object(models, "PROXY_PORT", port):
-            with self.assertRaisesRegex(RuntimeError, "not a verified CLIProxyAPI"):
-                proxy.ensure_proxy()
-            with socket.socket() as probe:
-                probe.settimeout(1.0)
-                self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0, "the port must be left as found")
-
-    def test_verified_listener_without_a_pid_file_is_refused_not_adopted(self):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        exe = _executable_copy(root, "cli-proxy-api")
-        port = _unroutable_port()
-        child = subprocess.Popen(
-            [str(exe), "-c", _MODELS_SERVER.replace("PORT", str(port))],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            env=_unvenved(),
-        )
-        self.addCleanup(self._stop_child, child)
-        _wait_for_port(port, child=child)
-        pid_file = root / "proxy.pid"
-        self._assert_listener_is_refused_and_left_running(exe, port, pid_file)
-        self.assertFalse(pid_file.exists(), "no ownership record may be published for an unstarted process")
-        self.assertIsNone(child.poll(), "a process we cannot attribute must be left running")
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "liveness is probed through /proc")
-    def test_pid_record_survives_a_probe_this_user_may_not_run(self):
-        if shutil.which("sudo") is None:
-            self.skipTest("needs sudo to create a process owned by another user")
-        probe = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=15)
-        if probe.returncode != 0:
-            self.skipTest("sudo on this box is not passwordless")
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        reported = root / "victim.pid"
-        staging = root / "victim.pid.staging"
-        release = root / "release"
-        code = (
-            "import os, pathlib, time\n"
-            f"pathlib.Path({str(staging)!r}).write_text(str(os.getpid()))\n"
-            f"os.replace({str(staging)!r}, {str(reported)!r})\n"
-            f"while not pathlib.Path({str(release)!r}).exists():\n"
-            "    time.sleep(0.05)\n"
-        )
-        victim = subprocess.Popen(
-            ["sudo", "-n", sys.executable, "-c", code],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.addCleanup(self._release_sudo_child, victim, release)
-        for _ in range(200):
-            if reported.exists():
-                break
-            time.sleep(0.05)
-        self.assertTrue(reported.exists(), "the root-owned victim never reported its pid")
-        pid = int(reported.read_text(encoding="ascii"))
-        self.assertEqual(os.stat(f"/proc/{pid}").st_uid, 0)
-        self.assertTrue(proxy._pid_is_alive(pid, time.monotonic() + 2))
-        pid_file = root / "proxy.pid"
-        pid_file.write_text(str(pid), encoding="ascii")
-        with patch.object(proxy, "PROXY_PID", pid_file), \
-             patch.object(proxy, "PROXY_EXE", root / "cli-proxy-api"):
-            self.assertFalse(proxy.proxy_is_ready(time.monotonic() + 2))
-        self.assertEqual(pid_file.read_text(encoding="ascii"), str(pid))
-
-    def test_missing_identity_helper_is_named_instead_of_claiming_a_foreign_process(self):
-        for helper, platform in (("ps", "freebsd"), ("lsof", "darwin")):
-            with self.subTest(helper=helper), \
-                 patch.object(proxy, "_pid_is_alive", return_value=True), \
-                 patch.object(proxy, "PROXY_EXE", Path("/srv/cli-proxy-api")), \
-                 patch.object(proxy.sys, "platform", platform), \
-                 patch.object(Path, "read_bytes", side_effect=OSError("proc unavailable")), \
-                 patch.object(proxy.subprocess, "run", side_effect=FileNotFoundError(2, "No such file")):
-                with self.assertRaisesRegex(RuntimeError, helper):
-                    proxy._pid_is_proxy(123, time.monotonic() + 2)
-
-    def test_tasklist_failure_is_named_instead_of_read_as_dead(self):
-        with patch.object(proxy.sys, "platform", "win32"), \
-             patch.object(proxy.subprocess, "run", return_value=SimpleNamespace(returncode=128, stdout="")), \
-             patch.object(proxy.subprocess, "CREATE_NO_WINDOW", 0, create=True):
-            with self.assertRaisesRegex(RuntimeError, "tasklist exited with status 128"):
-                proxy._pid_is_alive(123, time.monotonic() + 2)
 
     @unittest.skipUnless(not sys.platform.startswith("win"), "a self-signal is fatal only off Windows")
     def test_an_ignored_interrupt_is_not_turned_into_an_abort(self):
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             try:
-                with proxy._deferred_interrupts():
+                with process.deferred_interrupts():
                     os.kill(os.getpid(), signal.SIGINT)
             except BaseException as error:
                 self.fail(f"an ignored interrupt must stay ignored, got {type(error).__name__}")
         finally:
             signal.signal(signal.SIGINT, previous)
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "identity is read from /proc")
-    def test_executable_identity_resolves_both_sides(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            configured = _executable_alias(root, "cli-proxy-api")
-            link = root / "cliproxy-current"
-            link.symlink_to(configured)
-            elsewhere = root / "elsewhere"
-            elsewhere.mkdir()
-            other = _foreign_binary_alias(elsewhere, "cli-proxy-api")
-            child = subprocess.Popen(
-                [str(link), "-c", "import time; time.sleep(30)"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.addCleanup(self._stop_child, child)
-            with patch.object(proxy.sys, "platform", "linux"), \
-                 patch.object(proxy, "PROXY_EXE", configured):
-                self.assertTrue(proxy._pid_is_proxy(child.pid))
-            with patch.object(proxy.sys, "platform", "linux"), \
-                 patch.object(proxy, "PROXY_EXE", other):
-                self.assertFalse(proxy._pid_is_proxy(child.pid))
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "the listener is found through /proc")
-    def test_verified_listener_refuses_a_foreign_process_on_the_port(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            exe = _foreign_binary_alias(root, "cli-proxy-api")
-            port = _unroutable_port()
-            intruder = subprocess.Popen(
-                [sys.executable, "-c", _SOCKET_HOLDER.replace("PORT", str(port))],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.addCleanup(self._stop_child, intruder)
-            _wait_for_port(port, child=intruder)
-            self._assert_listener_is_refused_and_left_running(exe, port, root / "proxy.pid")
-            self.assertIsNone(intruder.poll())
-
-    def test_a_record_naming_a_foreign_process_is_not_treated_as_ours(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            exe = _foreign_binary(root, "cli-proxy-api")
-            port = _unroutable_port()
-            intruder = subprocess.Popen(
-                [sys.executable, "-c", _SOCKET_HOLDER.replace("PORT", str(port))],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.addCleanup(self._stop_child, intruder)
-            _wait_for_port(port, child=intruder)
-            pid_file = root / "proxy.pid"
-            pid_file.write_text(str(intruder.pid), encoding="ascii")
-            self._assert_listener_is_refused_and_left_running(exe, port, pid_file)
-            self.assertIsNone(intruder.poll())
 
     @unittest.skipUnless(not sys.platform.startswith("win"), "a self-signal is fatal only off Windows")
     def test_recorded_interrupt_outranks_a_failure_inside_the_spawn_window(self):
@@ -957,7 +626,8 @@ class ProxyLifecycleTests(unittest.TestCase):
             "     patch.object(proxy, 'PROXY_PORT', 1), \\\n"
             "     patch.object(proxy, 'PROXY_START_TIMEOUT', 0.6), \\\n"
             "     patch.object(proxy.subprocess, 'Popen', side_effect=spawn):\n"
-            "    proxy.ensure_proxy()\n",
+            "    with patch.object(proxy, 'fetch_upstream_models', side_effect=RuntimeError('no test listener')):\n"
+            "        proxy.ensure_proxy()\n",
             encoding="ascii",
         )
         result = subprocess.run(
@@ -977,44 +647,6 @@ class ProxyLifecycleTests(unittest.TestCase):
             "the recorded child must still be running, so the next launch can reclaim it",
         )
 
-    def test_unexpected_liveness_error_keeps_the_record_instead_of_being_swallowed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            pid_file = root / "proxy.pid"
-            pid_file.write_text("4242", encoding="ascii")
-            with patch.object(proxy, "PROXY_PID", pid_file), \
-                 patch.object(proxy, "PROXY_EXE", root / "cli-proxy-api"), \
-                 patch.object(proxy, "_pid_is_proxy", return_value=False), \
-                 patch.object(proxy, "_pid_is_alive", side_effect=OSError("unexpected errno")):
-                with self.assertRaises(OSError):
-                    proxy.proxy_is_ready(time.monotonic() + 1)
-            self.assertEqual(pid_file.read_text(encoding="ascii"), "4242")
-
-    def test_listener_identity_timeout_still_names_the_log(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            log = root / "proxy.log"
-            calls: list[list[str]] = []
-
-            def run(command, **kwargs):
-                calls.append(command)
-                if len(calls) == 1:
-                    return SimpleNamespace(returncode=0, stdout="/srv/cli-proxy-api --config config.yaml\n")
-                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
-
-            with patch.object(proxy, "PROXY_EXE", Path("/srv/cli-proxy-api")), \
-                 patch.object(proxy, "PROXY_LOG", log), \
-                 patch.object(proxy, "PROXY_PID", root / "proxy.pid"), \
-                 patch.object(proxy, "PROXY_START_TIMEOUT", 2.0), \
-                 patch.object(proxy, "_read_pid", return_value=123), \
-                 patch.object(proxy, "_pid_is_alive", return_value=True), \
-                 patch.object(proxy, "_port_is_open", return_value=True), \
-                 patch.object(proxy, "fetch_upstream_models", side_effect=RuntimeError("no models yet")), \
-                 patch.object(proxy.sys, "platform", "freebsd"), \
-                 patch.object(proxy.subprocess, "run", side_effect=run):
-                with self.assertRaises(RuntimeError) as caught:
-                    proxy.ensure_proxy()
-            self.assertIn(str(log), str(caught.exception))
 
     @unittest.skipUnless(
         sys.platform.startswith("linux"),
@@ -1064,7 +696,7 @@ class ProxyLifecycleTests(unittest.TestCase):
             def probe(deadline: float | None = None) -> bool:
                 handed.append(deadline)
                 if len(handed) == 1:
-                    time.sleep(0.6)
+                    time.sleep(0.03)
                 return False
 
             with patch.object(proxy, "PROXY_EXE", exe), \
@@ -1072,7 +704,7 @@ class ProxyLifecycleTests(unittest.TestCase):
                  patch.object(proxy, "PROXY_LOG", root / "proxy.log"), \
                  patch.object(proxy, "PROXY_PID", pid_file), \
                  patch.object(proxy, "PROXY_PORT", _unroutable_port()), \
-                 patch.object(proxy, "PROXY_START_TIMEOUT", 30.0), \
+                 patch.object(proxy, "PROXY_START_TIMEOUT", 0.15), \
                  patch.object(proxy, "_port_is_open", return_value=False), \
                  patch.object(proxy, "proxy_is_ready", side_effect=probe):
                 other_launcher = proxy._startup_lock()
@@ -1101,8 +733,7 @@ class ProxyLifecycleTests(unittest.TestCase):
 
                 with patch.object(proxy, "PROXY_PID", pid_file), \
                      patch.object(proxy, "PROXY_START_TIMEOUT", 2.0), \
-                     patch.object(proxy, "_pid_is_proxy", return_value=True), \
-                     patch.object(proxy, "fetch_upstream_models", side_effect=fetch):
+                             patch.object(proxy, "fetch_upstream_models", side_effect=fetch):
                     self.assertFalse(proxy.proxy_is_ready(time.monotonic() + budget))
 
                 if not probe_allowed:
@@ -1112,13 +743,6 @@ class ProxyLifecycleTests(unittest.TestCase):
                     self.assertGreater(issued[0], 0.0)
                     self.assertLessEqual(issued[0], budget + _CLOCK_SLACK)
 
-    def _release_sudo_child(self, victim: subprocess.Popen[bytes], release: Path) -> None:
-        release.touch()
-        try:
-            victim.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            victim.kill()
-            victim.wait(timeout=5)
 
     def _kill_strays(self, path: Path) -> None:
         for stray in _processes_running(path):
@@ -1160,7 +784,6 @@ class ProxyChildEnvironmentTests(unittest.TestCase):
              patch.object(proxy, "PROXY_EXE", self._executable(directory)), \
              patch.object(proxy, "_port_is_open", return_value=False), \
              patch.object(proxy, "_read_pid", return_value=None), \
-             patch.object(proxy, "_listener_pid", return_value=None), \
              patch.object(proxy, "_startup_lock", return_value=MagicMock()), \
              patch.object(proxy, "_publish_pid"), \
              patch.object(proxy.subprocess, "Popen", _FakePopen), \
@@ -1171,6 +794,56 @@ class ProxyChildEnvironmentTests(unittest.TestCase):
         self.assertTrue(all(not name.upper().startswith("CX_") for name in environment))
         self.assertNotIn("sk-proxy-secret", " ".join(environment.values()))
         self.assertEqual(environment["PATH"], "/usr/bin")
+
+
+class ProxyEndpointTests(unittest.TestCase):
+    def test_authenticated_listener_is_reused_without_a_pid_claim(self) -> None:
+        expected = "Bearer test-proxy-key"
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append((self.path, self.headers.get("Authorization")))
+                authenticated = self.headers.get("Authorization") == expected
+                body = b'{"object":"list","data":[]}'
+                self.send_response(200 if authenticated else 401)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+                worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+                worker.start()
+                try:
+                    with patch.object(models, "PROXY_HOST", "127.0.0.1"), \
+                         patch.object(models, "PROXY_PORT", server.server_port), \
+                         patch.object(models, "PROXY_API_KEY", "test-proxy-key"), \
+                         patch.object(proxy, "PROXY_HOST", "127.0.0.1"), \
+                         patch.object(proxy, "PROXY_PORT", server.server_port), \
+                         patch.object(proxy, "PROXY_PID", root / "proxy.pid"), \
+                         patch.object(proxy, "PROXY_LOG", root / "proxy.log"), \
+                         patch.object(proxy, "PROXY_START_TIMEOUT", 0.1), \
+                         patch.object(proxy.subprocess, "Popen") as spawn:
+                        proxy.ensure_proxy()
+                        self.assertFalse((root / "proxy.pid").exists())
+                        self.assertTrue(proxy.proxy_is_ready())
+                        with patch.object(models, "PROXY_API_KEY", "wrong-key"):
+                            self.assertFalse(proxy.proxy_is_ready())
+                            with self.assertRaisesRegex(RuntimeError, "left running"):
+                                proxy.ensure_proxy()
+                        self.assertTrue(proxy.proxy_is_ready())
+                        spawn.assert_not_called()
+                finally:
+                    server.shutdown()
+                    worker.join(2)
+        self.assertTrue(all(path == "/v1/models" for path, _ in received))
+        self.assertIn(("/v1/models", expected), received)
+        self.assertIn(("/v1/models", "Bearer wrong-key"), received)
 
 
 if __name__ == "__main__":

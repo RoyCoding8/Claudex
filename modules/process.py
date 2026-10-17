@@ -1,33 +1,24 @@
-"""Process lifecycle shared by the proxy and the router launcher.
-
-The two launchers ask the operating system the same questions -- is this pid
-alive, what does the pid file claim, is the port taken, can I hold the startup
-lock, may I run this probe without hanging -- and for five days each answered
-them with its own copy of the logic, several of the copies disagreeing. This
-module is the one authority for those answers.
-
-What counts as *our* process is not here. The proxy matches an executable path
-and the router matches an argv vector plus a working directory; identity is not
-the same question, so it stays with the launcher that owns it.
-"""
-
+"""Shared process probes, startup locks, and log rotation."""
 from __future__ import annotations
 
 import errno
 import os
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import FrameType
 from typing import TextIO
 
 MAX_PID = (1 << 32) - 1 if os.name == "nt" else (1 << 31) - 1
 
 _POLL_INTERVAL = 0.2
 _CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", errno.EAGAIN)})
-_ZOMBIES: set[int] = set()
 
 
 def _no_window() -> int:
@@ -40,80 +31,55 @@ def spawn_flags() -> int:
     return _no_window() | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 
-def run_tool(command: list[str], *, pid: int, timeout: float, label: str) -> subprocess.CompletedProcess[str]:
-    """Run an identity probe, or raise. A probe that cannot answer never answers "no"."""
-    if timeout <= 0:
-        raise subprocess.TimeoutExpired(command, timeout)
+@contextmanager
+def deferred_interrupts() -> Iterator[None]:
+    if sys.platform == "win32" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    guarded = (signal.SIGINT, signal.SIGHUP)
+    previous = {int(sig): signal.getsignal(sig) for sig in guarded}
+    recorded: list[int] = []
+
+    def record(signum: int, frame: FrameType | None) -> None:
+        recorded.append(signum)
+
+    for sig in guarded:
+        signal.signal(sig, record)
     try:
-        return subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            creationflags=_no_window(),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(f"{label} timed out while checking whether pid {pid} is running") from error
-    except OSError as error:
-        raise RuntimeError(f"{label} could not be run to check whether pid {pid} is running ({error})") from error
-
-
-def _darwin_state(pid: int) -> str:
-    """The first character of ps's state column for a pid, or "" if there is none.
-
-    POSIX requires kill(pid, 0) to succeed for a zombie, and XNU implements that
-    deliberately, so the liveness probe cannot tell one from a running process.
-    macOS exposes no /proc; the process table is reachable only through ps.
-    """
-    result = run_tool(
-        ["ps", "-o", "stat=", "-p", str(pid)],
-        pid=pid,
-        timeout=5.0,
-        label="ps",
-    )
-    # A zombie prints Z, optionally with a trailing + for a foreground group.
-    return result.stdout.strip()[:1]
+        yield
+    finally:
+        for sig in guarded:
+            signal.signal(sig, previous[int(sig)])
+        if recorded:
+            for signum in recorded:
+                os.kill(os.getpid(), signum)
 
 
 def pid_is_alive(pid: int, timeout: float) -> bool:
     if not 0 < pid <= MAX_PID:
         return False
     if sys.platform == "win32":
-        result = run_tool(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            pid=pid,
-            timeout=timeout,
-            label="tasklist",
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"tasklist exited with status {result.returncode} while checking whether pid {pid} is running"
-            )
-        return f'"{pid}"' in result.stdout and "no tasks are running" not in result.stdout.lower()
-    if sys.platform == "darwin":
-        # Ordered so the cheap syscall decides the common cases. A pid that is gone
-        # answers with an error and never reaches ps, and a pid that answers is the
-        # only one that can be a zombie. Callers poll this in a loop, so the fork
-        # is paid on the answer that is genuinely uncertain and nowhere else.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x100000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in {5, 87}:
+                return error == 5
+            raise ctypes.WinError(error)
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OverflowError:
-            return False
-        # A zombie outlives the answer only while its parent has not reaped it, and
-        # only this process can reap it. So a pid seen to be a zombie stays dead for
-        # us, and remembering that keeps the stop path from forking ps on every one
-        # of its polls. Nothing else is cached: a live pid can still become a zombie.
-        if pid in _ZOMBIES:
-            return False
-        if _darwin_state(pid) == "Z":
-            _ZOMBIES.add(pid)
-            return False
-        return True
+            result = kernel.WaitForSingleObject(handle, 0)
+            if result == -1:
+                raise ctypes.WinError(ctypes.get_last_error())
+            return result == 258
+        finally:
+            kernel.CloseHandle(handle)
     if sys.platform.startswith("linux"):
         try:
             state = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[-1].split(maxsplit=1)[0]
@@ -128,6 +94,10 @@ def pid_is_alive(pid: int, timeout: float) -> bool:
         return True
     except (ProcessLookupError, OverflowError):
         return False
+    if sys.platform == "darwin":
+        result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                text=True, timeout=max(0.001, timeout), check=False)
+        return result.stdout.strip()[:1] != "Z" and result.returncode == 0
     return True
 
 
@@ -158,7 +128,7 @@ def clear_pid(path: Path, pid: int) -> bool:
     return True
 
 
-def try_lock(handle: TextIO) -> bool:
+def try_lock(handle: TextIO, *, blocking: bool = False) -> bool:
     """False only when another holder has it. Every other failure propagates, because
     reading a broken filesystem as a held lock invents a launcher that will never run."""
     try:
@@ -166,11 +136,11 @@ def try_lock(handle: TextIO) -> bool:
             import msvcrt
 
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
     except BlockingIOError:
         return False
     except OSError as error:
@@ -178,6 +148,19 @@ def try_lock(handle: TextIO) -> bool:
             return False
         raise
     return True
+
+
+def lock_file(path: Path, *, blocking: bool = False) -> TextIO | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="ascii")
+    try:
+        if try_lock(handle, blocking=blocking):
+            return handle
+    except BaseException:
+        handle.close()
+        raise
+    handle.close()
+    return None
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float) -> bool:

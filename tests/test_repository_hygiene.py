@@ -216,7 +216,9 @@ def router_log_backup_count() -> int:
 
 
 def derived_artifact_names() -> dict[str, str]:
-    names = data_file_names("POOLS_FILE", "SETTINGS_FILE", "PROXY_LOG", "ROUTER_LOG", "ROUTER_BOOT_LOG")
+    names = data_file_names(
+        "POOLS_FILE", "SETTINGS_FILE", "PROXY_LOG", "ROUTER_LOG", "ROUTER_BOOT_LOG", "ROUTER_STATE_FILE"
+    )
     pools_file, settings_file = names["POOLS_FILE"], names["SETTINGS_FILE"]
     proxy_log, router_log = names["PROXY_LOG"], names["ROUTER_LOG"]
     return {
@@ -225,6 +227,8 @@ def derived_artifact_names() -> dict[str, str]:
         "proxy startup lock": Path(proxy_log).with_suffix(".lock").name,
         "router startup lock": Path(router_log).with_suffix(".lock").name,
         "router owner record": f"{router_log}.owner",
+        "router state lock": f".{Path(names['ROUTER_STATE_FILE']).name}.lock",
+        "router state atomic write temp": f".{Path(names['ROUTER_STATE_FILE']).name}.*",
         "pools conflict copy": f"{Path(pools_file).stem}.conflict*.json",
         "settings corruption backup": f"{Path(settings_file).stem}.broken_*.json",
         "pools atomic write temp": f".{pools_file}.*.tmp",
@@ -238,7 +242,9 @@ def writable_data_names() -> set[str]:
     logs = data_file_names("PROXY_LOG", "ROUTER_LOG", "ROUTER_BOOT_LOG")
     rotated = {f"{logs['ROUTER_LOG']}.{index}" for index in range(1, router_log_backup_count() + 1)}
     return (
-        set(data_file_names("POOLS_FILE", "SETTINGS_FILE", "PROXY_PID", "ROUTER_PID").values())
+        set(data_file_names(
+            "POOLS_FILE", "SETTINGS_FILE", "PROXY_PID", "ROUTER_PID", "ROUTER_STATE_FILE"
+        ).values())
         | set(logs.values())
         | rotated
         | set(derived_artifact_names().values())
@@ -383,7 +389,7 @@ class RepositoryHygieneTests(unittest.TestCase):
     def test_readme_data_inventory_matches_runtime_files(self) -> None:
         names = data_file_names(
             "POOLS_FILE", "SETTINGS_FILE", "POOLS_EXAMPLE_FILE", "SETTINGS_EXAMPLE_FILE",
-            "PROXY_PID", "ROUTER_PID", "PROXY_LOG", "ROUTER_LOG", "ROUTER_BOOT_LOG",
+            "PROXY_PID", "ROUTER_PID", "PROXY_LOG", "ROUTER_LOG", "ROUTER_BOOT_LOG", "ROUTER_STATE_FILE",
         )
         expected = set(names.values())
         expected.update(derived_artifact_names().values())

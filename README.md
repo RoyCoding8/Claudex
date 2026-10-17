@@ -144,16 +144,17 @@ exits (or cancels a sub-picker) when the search is already empty.
 
 ## Router semantics
 
-- **Selection**. Availability is filtered first, in every strategy: members that are cooling are set aside while any member is ready, and a member that has spent its dispatch cap is set aside entirely. A member missing `priority` falls to the *default* tier (`0`); missing `rpm` defaults to `1`. Within the surviving candidates the strategy decides:
-  - `fill-first` (default): only members at the lowest priority number are considered, chosen weighted-random by `rpm`. Drains a tier before touching the next.
-  - `round-robin`: cycles evenly through the members in config order; priority tiers and `rpm` weights are ignored. The rotation cursor tracks member *identity* and advances exactly once per request, under one atomic lock, parking just past the member the request started with: concurrent requests can never collide on the same starting member, a member skipped while cooling reclaims its own slot once it recovers, and a failover chain does not fling the cursor forward.
-  - `weighted`: draws weighted-random by `rpm` across *every* tier at once, so a low-priority member still gets its share of traffic.
-  - `least-busy`: picks among the members holding the fewest live in-flight dispatches, breaking ties weighted-random by `rpm`. Best when members differ in latency rather than quota.
+- **Selection**. Each strategy orders members, then one scheduler reserves the first member with dispatch capacity, preferring ready members over cooling ones. Missing `priority` defaults to `0`; missing `rpm` defaults to `1`.
+  - `fill-first` (default): lower priority numbers first, with weighted ordering by `rpm` within each tier.
+  - `round-robin`: config order, starting at a cursor that advances once per request. Failover does not advance it again; changing member order resets it.
+  - `weighted`: weighted ordering by `rpm` across every tier.
+  - `least-busy`: fewest live dispatches first, with weighted ordering to break ties. Selection and in-flight reservation share one lock.
 - **Pacing**. A member with an explicit `rpm` (or a `limit` override) is *proactively rate-limited*: once that many requests have been sent in the trailing 60 s window, the member leaves the candidate set, so another member serves the request instead of burning a `429`; if every member is paced out the request fails with a sanitized `503` rather than overrunning a cap. The sliding window ages out on its own, so the member rejoins the set when its oldest request falls out of it.
-- **Retry**. Pool failover is protocol-driven, not provider-message-driven. A `5xx`, a network error, an SSE `error` **frame envelope**, or a transient `4xx` (`408`/`409`/`425`/`429`) seen before the commit point cools that backend and tries the next member. Any other `4xx` (`400`, `404`, `422`, ...) is terminal: the request itself is wrong, so the provider's own error is forwarded to the client unchanged and no member is cooled. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It sweeps every pool member in priority order, and by default sweeps the list twice (`CX_ROUTER_POOL_PASSES`) before giving up. Capacity-limited providers reject transiently, so a member that failed one sweep often succeeds on the next; a short backoff (1 s, scaling with the sweep number) separates the sweeps so the second pass is not a millisecond replay of the first. Sweeps stop early at the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`); each attempt's upstream wait is clamped to what remains of that budget.
+- **Retry**. Pool failover is protocol-driven, not provider-message-driven. A `5xx`, a network error, an SSE `error` **frame envelope**, or a transient `4xx` (`408`/`409`/`425`/`429`) seen before the commit point cools that backend and tries the next member. Provider-auth `401`/`403` responses also cool that member and try another, because credentials belong to each configured backend. Other `4xx` responses (`400`, `422`, ...) are terminal: the provider's error is forwarded unchanged and no member is cooled. The router reads only envelopes (`event:` and top-level JSON `type`), never assistant text, so a model may safely discuss `event: error`. It sweeps every pool member in priority order, and by default sweeps the list twice (`CX_ROUTER_POOL_PASSES`) before giving up. Capacity-limited providers reject transiently, so a member that failed one sweep often succeeds on the next; a short backoff (1 s, scaling with the sweep number) separates the sweeps so the second pass is not a millisecond replay of the first. Sweeps stop early at the request-wide deadline (180 s, `CX_ROUTER_POOL_TIMEOUT`); each attempt's upstream wait is clamped to what remains of that budget.
 - **Empty responses**. A `200` carrying no usable content is a failure, not an answer: zero bytes, no complete SSE frame, an unparseable body, `{}`, an empty content array, or a stream that reaches its terminal event without a single content frame. Any of these cools the member (20 s, `CX_ROUTER_COOLDOWN_EMPTY`) and fails over, so a flaky provider returning empties can no longer stall the client. Each format is judged in its own vocabulary (see **Wire formats** below); a tool-call-only turn counts as content in all three. `count_tokens` is exempt from the content check, because its success body legitimately has none.
 - **Cooldown**. `429` honors `Retry-After`; absent that, a member with a per-minute cap uses the short paced-429 cooldown (10 s, `CX_ROUTER_COOLDOWN_PACED_429`) and all other members use 60 s. A per-member `cooldown` overrides either default. A cooldown is an ordering preference rather than a pool-wide outage: if all alternatives are cooling, each is retried before the router returns `503`.
 - **Streaming**. The router holds an SSE response until it proves it carries content, which is the first content frame in that format's vocabulary. It then replays the buffered head and streams the rest incrementally via `HTTPResponse.read1()`. Committing therefore costs only the provider's real time-to-first-token, and the client still receives the stream from its very first frame. Once bytes have been forwarded, retrying is unsafe; a later upstream interruption is emitted as a final SSE `error` event, logged, and cools the member so the next request avoids it. Non-streaming responses are buffered only long enough to restore `Content-Length`, allowing clients to distinguish complete and truncated responses.
+- **Limits**. At most eight forwarded requests run at once, including their streams and retries. At capacity, another forwarding request receives a JSON `503`; health checks and authentication failures remain available. Handler threads are not capped. Request bodies are limited to 16 MiB and client reads have a 60 s deadline. Rate-limit reservations stay in memory. Cooldown changes and graceful shutdown save `data/router-state.json`, without syncing every dispatch to disk. Snapshot failures are logged and do not fail requests; an abrupt exit can lose recent reservations. An unreadable or invalid existing state file prevents startup, and a file lock prevents two routers sharing that state path.
 - **Passthrough**. On a pooled route, if the incoming `model` field is not one of your enabled pool names, the request is forwarded unchanged, but the empty-response check still applies. A single model has no sibling to fail over to, so the equivalent recovery is another attempt at the *same* backend: an unusable `200` is retried up to 3 times (`CX_ROUTER_DIRECT_ATTEMPTS`) with a short backoff, bounded by the same request deadline. Nothing has reached the client at that point, so the retry is invisible; only when every attempt comes back empty does the client see a `502`. Status codes the provider deliberately sent (`4xx`, `429` with its `Retry-After`, `5xx`) are forwarded unchanged and never retried locally. They carry information the client needs, and Claude Code already retries the transient ones itself. Pooled `count_tokens` requests use the same failover policy.
 - **Errors**. Non-pooled requests preserve upstream responses unchanged. A pool returns a sanitized `503` only after every member was attempted or the request deadline expired. The response includes a correlation `request_id`; upstream error bodies from pooled attempts are not logged, and only bounded redacted diagnostics record the failure category.
 
@@ -215,6 +216,9 @@ Defaults:
 
 Both keys are for local traffic between Claude Code, the router, and CLIProxyAPI on your machine.
 Real provider credentials live inside CLIProxyAPI's `config.yaml`, never in this repo.
+The built-in keys are accepted only on loopback. Wildcard binds (`0.0.0.0` or `::`) require
+explicit non-default keys. Both services use plain HTTP, so a custom key does not protect traffic
+from network eavesdropping; keep them on trusted interfaces.
 
 ## Environment overrides
 
@@ -230,8 +234,8 @@ Router:
 - `CX_ROUTER_COOLDOWN_429`, `CX_ROUTER_COOLDOWN_5XX`, `CX_ROUTER_COOLDOWN_NETWORK`,
   `CX_ROUTER_COOLDOWN_AUTH`, `CX_ROUTER_COOLDOWN_PACED_429`, `CX_ROUTER_COOLDOWN_EMPTY`
   (seconds, clamped to 1 through 1800)
-- `CX_ROUTER_POOL_TIMEOUT` (seconds, default 180): whole-request budget shared by every
-  failover attempt
+- `CX_ROUTER_POOL_TIMEOUT` (seconds, default 180): upstream request budget shared by every
+  failover attempt. Client request headers and body have a separate 60-second total limit.
 - `CX_ROUTER_POOL_PASSES` (default 2): sweeps over the member list before a pool gives up
 - `CX_ROUTER_DIRECT_ATTEMPTS` (default 3): attempts a single, non-pooled model gets when a `200`
   carries no usable content; `1` disables the retry
@@ -263,6 +267,7 @@ modules/
   pools.py                  # pools.json schema + load/save + validation
   models.py                 # /v1/models fetch, dedup, categorization
   launcher.py               # spawn Claude Code with ANTHROPIC_BASE_URL set
+  router_state.py           # in-memory quotas and cooldowns, restart snapshots
   tui.py                    # model picker
   pool_tui.py               # F7 pool editor
   config.py                 # env-driven config
@@ -274,6 +279,9 @@ data/
   pools.conflict*.json
   .pools.json.*.tmp
   settings.json             # your local picker state (ignored)
+  router-state.json         # persisted per-model rate limits and cooldowns (ignored)
+  .router-state.json.lock
+  .router-state.json.*     # atomic state writes in progress
   .settings.json.lock
   settings.broken_*.json
   .settings.json.*.tmp
@@ -289,7 +297,7 @@ data/
   router.boot.log.1
   router.lock
   router.log.owner
-  router.pid                # router pid (ignored)
+  router.pid                # router PID and instance token (ignored)
 tests/
   test_config_errors.py     # invalid environment values and import behavior
   test_cx.py                # launcher loop, wrappers, and malformed pool files
@@ -303,6 +311,7 @@ tests/
   test_router.py            # pool selection, strategies, forwarding, failover, streaming
   test_router_hardening.py  # deadlines, sweeps, empty/truncated bodies, error sanitizing
   test_router_regressions.py # router regression coverage
+  test_router_state.py     # persistent quota/cooldown state
   test_router_starter.py    # router lifecycle and health checks
   test_tui.py               # picker exit safety and model parameter editing
   test_tui_settings.py      # settings corruption recovery and lost-update protection
@@ -338,10 +347,15 @@ CLIProxyAPI or a provider.
 
 ## Multi-session support
 
-The router is a long-lived subprocess (PID in `data/router.pid`, log in `data/router.log`). A
-second launcher in another terminal detects the running router and reuses it. Only one CLIProxyAPI
-process and one router process are ever needed regardless of how many Claude Code sessions you
-have open.
+The router is a long-lived subprocess. After binding its port, it publishes its own PID and a
+fresh instance token in `data/router.pid`. A launcher reuses it only when `/health` matches both
+values. Windows uses an exclusive socket bind. An occupied port that fails verification is left
+running and reported, so starting another session cannot kill a busy or unrelated process.
+
+Stopping the router uses `POST /-/shutdown`, requiring the router API key and the current
+`X-CX-Router-Token`. Shutdown waits for active handlers. CLIProxyAPI is reused when its authenticated
+`/v1/models` endpoint responds correctly; a PID file is not required for reuse. Failed startup
+cleanup stops only the child that the launcher itself spawned.
 
 ## Logs
 

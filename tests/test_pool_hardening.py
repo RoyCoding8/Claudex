@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -68,18 +69,15 @@ class PoolHardeningTests(unittest.TestCase):
     def tearDown(self) -> None:
         _LOADED_DIGESTS.clear()
 
-    def test_pool_lock_requires_an_interprocess_primitive(self) -> None:
+    def test_pool_lock_failure_does_not_publish(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pools.json"
-            with (
-                patch("modules.pools.fcntl_module", None),
-                patch("modules.pools.msvcrt_module", None),
-                self.assertRaisesRegex(RuntimeError, "interprocess"),
-            ):
-                with _pool_file_lock(path):
-                    self.fail("lock should not be available")
+            with patch("modules.pools.process.lock_file", side_effect=OSError("lock failed")):
+                with self.assertRaises(OSError):
+                    load_pools(path)
+            self.assertFalse(path.exists())
 
-    @requires_symlinks
+    @unittest.skipIf(sys.platform == "win32", "symlinks require Windows developer privileges")
     def test_symlink_alias_uses_canonical_lock_and_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -189,7 +189,7 @@ class PoolTests(unittest.TestCase):
                 ModelPool("duplicate", (PoolMember("a/x"), PoolMember("b/x"))),
                 ModelPool("duplicate", (PoolMember("c/x"), PoolMember("d/x"))),
             ], {}),
-            ("duplicate member", ValueError, "Duplicate member",
+            ("duplicate member", ValueError, "repeats model",
              [ModelPool("pool", (PoolMember("same/model"), PoolMember("same/model")))], {}),
             ("upstream pool collision", RuntimeError, "conflicts",
              [ModelPool("taken", (PoolMember("a/x"), PoolMember("b/x")))],

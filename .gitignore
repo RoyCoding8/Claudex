@@ -31,6 +31,8 @@ data/*.err
 data/*.tmp
 data/*.staging
 data/*.lock
+data/router-state.json
+data/.router-state.json.*
 tmp/
 
 # Editors

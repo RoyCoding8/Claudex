@@ -8,12 +8,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules import router
-from modules.router import _CooldownTable, _Member, _pick_member, _Pool, _RateLimiter, _sse_frame_is_error
+from modules.router import _grammar_for, _Member, _Pool, _Scheduler, _SseScan
+from modules.router_state import RouterState
 from tests.test_router import _DELTA, _OK_BODY, _SSE, _START, _STOP, _post, _running_router
 from tests.test_router_regressions import _pool_passes
 
 
 class RouterHardeningTests(unittest.TestCase):
+    def test_single_crlf_does_not_complete_an_sse_frame(self) -> None:
+        scan = _SseScan(_grammar_for("/v1/messages"))
+        scan.feed(b"event: content_block_delta\r\n")
+        self.assertFalse(scan.has_content)
+        scan.feed(b'data: {"delta":{"text":"hi"}}\r\n')
+        self.assertFalse(scan.has_content)
+        scan.feed(b"\r\n")
+        self.assertTrue(scan.has_content)
+
     def test_assistant_text_containing_event_error_is_not_a_stream_error(self) -> None:
         body = (
             b'event: content_block_delta\n'
@@ -33,8 +43,11 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual((status, received), (200, body))
 
     def test_later_stream_error_is_identified_by_envelope_not_message_text(self) -> None:
-        self.assertFalse(_sse_frame_is_error(b'event: content_block_delta\ndata: {"delta":{"text":"event: error"}}\n\n'))
-        self.assertTrue(_sse_frame_is_error(b'event: error\ndata: {"type":"error"}\n\n'))
+        scan = _SseScan(_grammar_for("/v1/messages"))
+        scan.feed(b'event: content_block_delta\ndata: {"delta":{"text":"event: error"}}\n\n')
+        self.assertFalse(scan.saw_error)
+        scan.feed(b'event: error\ndata: {"type":"error"}\n\n')
+        self.assertTrue(scan.saw_error)
 
     def test_early_stream_error_is_not_masked_by_later_content(self) -> None:
         error = b'event: error\ndata: {"type":"error","error":{"message":"early"}}\n\n'
@@ -59,8 +72,8 @@ class RouterHardeningTests(unittest.TestCase):
         with _pool_passes(1), _running_router(
             (500, {}, b"first"), (500, {}, b"second"), members=members
         ) as router:
-            router.cooldowns.cooldown("provider/first", 30, "test")
-            router.cooldowns.cooldown("provider/second", 30, "test")
+            router.runtime_state.cooldown("provider/first", 30)
+            router.runtime_state.cooldown("provider/second", 30)
             status, payload = _post(router)
         self.assertEqual(status, 503)
         self.assertEqual(len(json.loads(payload)["error"]["attempts"]), 2)
@@ -89,10 +102,12 @@ class RouterHardeningTests(unittest.TestCase):
 
     def test_priority_preserved_when_all_members_cooling(self) -> None:
         pool = _Pool("p", (_Member("first", 1, 1), _Member("second", 1, 2)))
-        cooldowns = _CooldownTable()
-        cooldowns.cooldown("first", 10, "test")
-        cooldowns.cooldown("second", 10, "test")
-        self.assertEqual(_pick_member(pool, cooldowns, set(), _RateLimiter()).model, "first")
+        state = RouterState()
+        scheduler = _Scheduler(state)
+        state.cooldown("first", 10)
+        state.cooldown("second", 10)
+        with scheduler.hold(pool, set()) as member:
+            self.assertEqual(member.model, "first")
 
     def test_later_stream_error_is_forwarded_and_logged(self) -> None:
         head = _START + _DELTA
@@ -101,7 +116,7 @@ class RouterHardeningTests(unittest.TestCase):
             router.upstream_state.stream_gate.set()
             with self.assertLogs("cx.router", level="WARNING") as logs:
                 status, received = _post(router)
-            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+            self.assertFalse(router.runtime_state.is_ready("provider/first"))
         self.assertEqual(status, 200)
         self.assertEqual(received, head + error)
         self.assertTrue(any("trailing SSE error" in line for line in logs.output))
@@ -126,7 +141,7 @@ class RouterHardeningTests(unittest.TestCase):
         with _running_router((200, {**_SSE, "Content-Length": "999"}, (head, b"__drop__"))) as router:
             router.upstream_state.stream_gate.set()
             status, received = _post(router)
-            self.assertFalse(router.cooldowns.is_ready("provider/first"))
+            self.assertFalse(router.runtime_state.is_ready("provider/first"))
         self.assertEqual(status, 200)
         self.assertTrue(received.startswith(head))
         self.assertIn(b'event: error', received)
@@ -141,7 +156,7 @@ class RouterHardeningTests(unittest.TestCase):
             router.upstream_state.stream_gate.set()
             status, received = _post(router)
         self.assertEqual((status, received), (200, stream))
-        self.assertTrue(router.cooldowns.is_ready("provider/first"))
+        self.assertTrue(router.runtime_state.is_ready("provider/first"))
 
     def test_content_stream_without_terminal_emits_error_and_cools_member(self) -> None:
         stream = (
@@ -154,7 +169,7 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertTrue(received.startswith(stream))
         self.assertIn(b'event: error', received)
         self.assertEqual(router.upstream_state.models, ["provider/first"])
-        self.assertFalse(router.cooldowns.is_ready("provider/first"))
+        self.assertFalse(router.runtime_state.is_ready("provider/first"))
 
     def test_undelimited_post_commit_sse_frame_is_bounded(self) -> None:
         head = _START + _DELTA
@@ -168,7 +183,7 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertTrue(received.startswith(head))
         self.assertIn(b'event: error', received)
         self.assertEqual(router.upstream_state.models, ["provider/first"])
-        self.assertFalse(router.cooldowns.is_ready("provider/first"))
+        self.assertFalse(router.runtime_state.is_ready("provider/first"))
 
     def test_oversized_pre_commit_sse_frame_fails_over_before_headers(self) -> None:
         oversized = b"data: " + b"x" * 64
@@ -181,7 +196,28 @@ class RouterHardeningTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(received, _OK_BODY)
         self.assertEqual(router.upstream_state.models, ["provider/first", "provider/second"])
-        self.assertFalse(router.cooldowns.is_ready("provider/first"))
+        self.assertFalse(router.runtime_state.is_ready("provider/first"))
+
+    def test_complete_oversized_frame_after_content_is_not_forwarded(self) -> None:
+        head = _START + _DELTA
+        oversized = b"data: " + b"x" * 256 + b"\n\n"
+        with patch("modules.router._MAX_SSE_FRAME_BYTES", 128), _running_router(
+            (200, _SSE, head + oversized + _STOP),
+        ) as server:
+            status, received = _post(server)
+        self.assertEqual(status, 200)
+        self.assertTrue(received.startswith(head))
+        self.assertNotIn(b"x" * 256, received)
+        self.assertIn(b"event: error", received)
+        self.assertEqual(server.upstream_state.models, ["provider/first"])
+        self.assertFalse(server.runtime_state.is_ready("provider/first"))
+
+    def test_malformed_chat_choice_does_not_crash_stream_validation(self) -> None:
+        scan = _SseScan(_grammar_for("/v1/chat/completions"))
+        scan.feed(b'data: {"choices":[1]}\n\n')
+        self.assertFalse(scan.has_content)
+        scan.feed(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')
+        self.assertTrue(scan.has_content)
 
     def test_heartbeat_only_sse_beyond_head_peek_fails_over(self) -> None:
         heartbeat = b": ping\n\n" * 8

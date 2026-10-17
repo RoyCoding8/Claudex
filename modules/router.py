@@ -5,8 +5,11 @@ import gzip
 import hmac
 import json
 import logging
+import math
+import os
 import random
 import re
+import secrets
 import socket
 import socketserver
 import sys
@@ -14,19 +17,18 @@ import threading
 import time
 import uuid
 import zlib
-from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPException
+from http.client import HTTPConnection, HTTPException, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import chain
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from .config import (
@@ -50,9 +52,12 @@ from .config import (
     ROUTER_POOL_TIMEOUT,
     ROUTER_PORT,
     ROUTER_START_TIMEOUT,
+    ROUTER_STATE_FILE,
 )
 from .models import _MAX_MODEL_ID_LENGTH, _MAX_MODELS_BYTES
 from .pools import _is_structurally_valid, _reject_duplicate_json_keys, parse_pool_document
+from .router_starter import clear_router_identity, publish_router_identity
+from .router_state import RouterState
 from .urls import http_url, is_local_host
 
 _UPSTREAM_TIMEOUT = 600.0
@@ -64,13 +69,15 @@ _MODELS_CACHE_TTL = 30.0
 _POOLS_STAT_INTERVAL = 0.25
 _HEAD_PEEK_BYTES = 256 * 1024
 _MAX_SSE_FRAME_BYTES = 256 * 1024
-_MAX_BODY_BYTES = 128 * 1024 * 1024
+_MAX_BODY_BYTES = 16 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_MAX_ACTIVE_REQUESTS = 8
 _MAX_MODELS_RESPONSE_BYTES = _MAX_MODELS_BYTES
 _MAX_POOL_FILE_BYTES = 1 * 1024 * 1024
 _SWEEP_BACKOFF = 1.0
 _DIRECT_BACKOFF = 0.5
 _HANDLER_TIMEOUT = 30
+_CLIENT_REQUEST_TIMEOUT = 60.0
 _LOG_MAX_BYTES = 5_000_000
 _now = time.monotonic
 _COOLDOWN_ON_429_DEFAULT = ROUTER_COOLDOWN_429
@@ -88,8 +95,17 @@ _HOP_BY_HOP = frozenset({
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
 })
 _STRIPPED = frozenset({"authorization", "x-api-key", "host", "accept-encoding", "expect"})
+
+
+def _socket_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - _now()
+    if remaining <= 0:
+        raise TimeoutError("upstream request deadline exceeded")
+    return min(maximum, remaining)
 _LOG = logging.getLogger("cx.router")
-_SSE_BOUNDARY = re.compile(br"(?:\r\n|\r|\n){2}")
+_SSE_BOUNDARY = re.compile(br"(?>\r\n|\r|\n){2}")
 _HEADER_FIELD_NAME = re.compile(br"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _FORBIDDEN_FIELD_BYTES = frozenset(chr(code) for code in range(0x20) if code != 0x09) | {chr(0x7F)}
 
@@ -168,6 +184,14 @@ def _request_path(target: str) -> str | None:
     return urlsplit(normalized).path if normalized is not None else None
 
 
+def _safe_log_path(target: str) -> str:
+    try:
+        path = urlsplit(target).path
+    except ValueError:
+        return "<invalid>"
+    return path if path.startswith("/") else "<invalid>"
+
+
 @dataclass(frozen=True, slots=True)
 class _Member:
     model: str
@@ -182,29 +206,6 @@ class _Pool:
     name: str
     members: tuple[_Member, ...]
     strategy: str = "fill-first"
-
-
-class _InFlight:
-    def __init__(self) -> None:
-        self._counts: dict[str, int] = {}
-        self._lock = threading.Lock()
-
-    def count(self, model: str) -> int:
-        with self._lock:
-            return self._counts.get(model, 0)
-
-    @contextmanager
-    def hold(self, model: str) -> Iterator[None]:
-        with self._lock:
-            self._counts[model] = self._counts.get(model, 0) + 1
-        try:
-            yield
-        finally:
-            with self._lock:
-                if (remaining := self._counts.get(model, 1) - 1) > 0:
-                    self._counts[model] = remaining
-                else:
-                    self._counts.pop(model, None)
 
 
 class _PoolRegistry:
@@ -293,153 +294,49 @@ def _parse_pools(payload: Any) -> dict[str, _Pool]:
     }
 
 
-class _RateLimiter:
-    _WINDOW = 60.0
-    def __init__(self) -> None:
-        self._hits: dict[str, deque[float]] = {}
+class _Scheduler:
+    def __init__(self, state: RouterState) -> None:
+        self.state = state
+        self._counts: dict[str, int] = {}
+        self._cursors: dict[str, tuple[tuple[str, ...], int]] = {}
         self._lock = threading.Lock()
 
-    @classmethod
-    def _prune(cls, hits: deque[float], now: float) -> None:
-        while hits and hits[0] <= now - cls._WINDOW:
-            hits.popleft()
-
-    def reserve(self, model: str, limit: int | None) -> bool:
-        if limit is None:
-            return True
-        if limit <= 0:
-            return False
-        now = _now()
+    def count(self, model: str) -> int:
         with self._lock:
-            hits = self._hits.setdefault(model, deque())
-            self._prune(hits, now)
-            if len(hits) >= limit:
-                return False
-            hits.append(now)
-            return True
+            return self._counts.get(model, 0)
 
-
-class _CooldownTable:
-    def __init__(self) -> None:
-        self._until: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def is_ready(self, model: str) -> bool:
+    @contextmanager
+    def hold(self, pool: _Pool, tried: set[str]) -> Iterator[_Member | None]:
         with self._lock:
-            expiry = self._until.get(model)
-            if expiry is None:
-                return True
-            if expiry <= _now():
-                del self._until[model]
-                return True
-            return False
-
-    def cooldown(self, model: str, seconds: float, reason: str) -> None:
-        seconds = max(1.0, min(seconds, 1800.0))
-        with self._lock:
-            self._until[model] = _now() + seconds
-        _LOG.info("cooldown %.0fs on %s (%s)", seconds, _log_text(model), _log_text(reason))
-
-    def clear(self, model: str) -> None:
-        with self._lock:
-            self._until.pop(model, None)
-
-
-def _weighted_choice(members: list[_Member]) -> _Member:
-    if len(members) == 1:
-        return members[0]
-    point, total = random.uniform(0, sum(m.rpm for m in members)), 0.0
-    for member in members:
-        total += member.rpm
-        if point <= total:
-            return member
-    return members[-1]
-
-
-class _Rotation:
-    def __init__(self) -> None:
-        self._state: dict[str, tuple[int, int]] = {}
-        self._lock = threading.Lock()
-
-    def reserve(self, pool: str, size: int,
-                choose: Callable[[int], int | None]) -> int | None:
-        if size <= 0:
-            return None
-        with self._lock:
-            known, cursor = self._state.get(pool, (size, 0))
-            index = choose(cursor if known == size else 0)
-            if index is not None:
-                self._state[pool] = (size, (index + 1) % size)
-            return index
-
-    def cursor(self, pool: str, size: int) -> int:
-        with self._lock:
-            known, cursor = self._state.get(pool, (size, 0))
-            return cursor if known == size else 0
-
-
-def _top_tier(members: list[_Member]) -> list[_Member]:
-    top = min(member.priority for member in members)
-    return [member for member in members if member.priority == top]
-
-
-def _idlest(members: list[_Member], inflight: _InFlight | None) -> list[_Member]:
-    counts = {m.model: inflight.count(m.model) if inflight else 0 for m in members}
-    least = min(counts.values())
-    return [member for member in members if counts[member.model] == least]
-
-
-_SELECTORS: dict[str, Callable[[list[_Member], _InFlight | None], _Member]] = {
-    "fill-first": lambda selected, inflight: _weighted_choice(_top_tier(selected)),
-    "weighted": lambda selected, inflight: _weighted_choice(selected),
-    "least-busy": lambda selected, inflight: _weighted_choice(_idlest(selected, inflight)),
-}
-
-
-def _pick_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
-                 limiter: _RateLimiter | None = None,
-                 start: int | None = None,
-                 inflight: _InFlight | None = None,
-                 rotation: _Rotation | None = None) -> _Member | None:
-    if pool.strategy == "round-robin":
-        return _rotate_member(pool, cooldowns, exclude, limiter, start or 0, rotation)
-    candidates = [member for member in pool.members if member.model not in exclude]
-    if not candidates:
-        return None
-    selected = [member for member in candidates if cooldowns.is_ready(member.model)]
-    if not selected:
-        selected = candidates
-    selector = _SELECTORS.get(pool.strategy, _SELECTORS["fill-first"])
-    while selected:
-        member = selector(selected, inflight)
-        if limiter is None or limiter.reserve(member.model, member.limit):
-            return member
-        selected = [candidate for candidate in selected if candidate.model != member.model]
-    return None
-
-
-def _rotate_member(pool: _Pool, cooldowns: _CooldownTable, exclude: set[str],
-                   limiter: _RateLimiter | None, start: int,
-                   rotation: _Rotation | None) -> _Member | None:
-    def scan(from_index: int) -> int | None:
-        size = len(pool.members)
-        order = [pool.members[(from_index + offset) % size] for offset in range(size)]
-        order = [member for member in order if member.model not in exclude]
-        tiers: tuple[Callable[[_Member], bool], ...]
-        if limiter is None:
-            tiers = (lambda m: cooldowns.is_ready(m.model), lambda m: True)
-        else:
-            tiers = (
-                lambda m: cooldowns.is_ready(m.model) and limiter.reserve(m.model, m.limit),
-            )
-        for accepts in tiers:
-            if member := next((m for m in order if accepts(m)), None):
-                return next(i for i, m in enumerate(pool.members) if m.model == member.model)
-        return None
-
-    size = len(pool.members)
-    index = rotation.reserve(pool.name, size, scan) if rotation is not None else scan(start)
-    return pool.members[index] if index is not None else None
+            members = list(pool.members)
+            identity = tuple(m.model for m in members)
+            known, cursor = self._cursors.get(pool.name, (identity, 0))
+            cursor = cursor if known == identity else 0
+            if pool.strategy == "round-robin":
+                members = members[cursor:] + members[:cursor]
+            else:
+                members.sort(key=lambda m: -math.log1p(-random.random()) / m.rpm)
+                if pool.strategy == "least-busy":
+                    members.sort(key=lambda m: self._counts.get(m.model, 0))
+                elif pool.strategy == "fill-first":
+                    members.sort(key=lambda m: m.priority)
+            members = [m for m in members if m.model not in tried]
+            members.sort(key=lambda m: not self.state.is_ready(m.model))
+            member = next((m for m in members if self.state.reserve(m.model, m.limit)), None)
+            if member is not None:
+                self._counts[member.model] = self._counts.get(member.model, 0) + 1
+                if pool.strategy == "round-robin" and not tried:
+                    self._cursors[pool.name] = (identity, (pool.members.index(member) + 1) % len(identity))
+        try:
+            yield member
+        finally:
+            if member is not None:
+                with self._lock:
+                    remaining = self._counts[member.model] - 1
+                    if remaining:
+                        self._counts[member.model] = remaining
+                    else:
+                        del self._counts[member.model]
 
 
 @dataclass(slots=True)
@@ -449,18 +346,10 @@ class _UpstreamResponse:
     headers: list[tuple[str, str]]
     body_iter: Iterable[bytes]
     connection: HTTPConnection
-    body_socket: Any = None
+    prefix: tuple[bytes, ...] = ()
+    scanner: _SseScan | None = None
     buffered: bytes | None = None
     _closed: bool = False
-
-    def relax_timeout(self, deadline: float | None = None) -> None:
-        if self.body_socket is None:
-            return
-        remaining = _UPSTREAM_TIMEOUT if deadline is None else max(1.0, deadline - _now())
-        try:
-            self.body_socket.settimeout(min(_UPSTREAM_TIMEOUT, remaining))
-        except OSError:
-            pass
 
     def close(self) -> None:
         if self._closed:
@@ -472,20 +361,20 @@ class _UpstreamResponse:
             pass
 
 def _forward_to_upstream(method: str, path: str, request_headers: dict[str, str], body: bytes,
-                         deadline: float | None = None) -> _UpstreamResponse:
-    leash = _UPSTREAM_TIMEOUT if deadline is None else max(1.0, deadline - _now())
-    conn = HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=min(_UPSTREAM_TIMEOUT, leash))
+                         deadline: float) -> _UpstreamResponse:
+    conn = HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=_socket_timeout(deadline, _UPSTREAM_TIMEOUT))
+    conn.response_class = _deadline_response_class(deadline)
     try:
-        conn.request(method, path, body=body, headers=request_headers)
+        conn.connect()
         if conn.sock is not None:
-            conn.sock.settimeout(min(_UPSTREAM_HEADER_TIMEOUT, leash))
+            conn.sock.settimeout(_socket_timeout(deadline, _UPSTREAM_TIMEOUT))
+        conn.request(method, path, body=body, headers=request_headers)
         response = conn.getresponse()
     except BaseException:
         conn.close()
         raise
-    body_socket = conn.sock or getattr(getattr(response.fp, "raw", None), "_sock", None)
-    if body_socket is not None:
-        body_socket.settimeout(min(_UPSTREAM_HEADER_TIMEOUT, leash))
+    if isinstance(response.fp, _DeadlineReader):
+        response.fp.max_timeout = _UPSTREAM_TIMEOUT
 
     response_headers = [(key, value) for key, value in response.getheaders() if key.lower() not in _HOP_BY_HOP]
     gzip_response = (
@@ -506,8 +395,8 @@ def _forward_to_upstream(method: str, path: str, request_headers: dict[str, str]
             while True:
                 chunk = body_source.read1(65536)
                 if not chunk:
-                    remaining = getattr(response, "length", None)
-                    if remaining not in (None, 0):
+                    remaining_length = getattr(response, "length", None)
+                    if remaining_length not in (None, 0):
                         raise HTTPException("upstream closed before declared Content-Length")
                     return
                 yield chunk
@@ -519,7 +408,7 @@ def _forward_to_upstream(method: str, path: str, request_headers: dict[str, str]
             except OSError:
                 pass
 
-    return _UpstreamResponse(response.status, response.reason or "", response_headers, iterate(), conn, body_socket)
+    return _UpstreamResponse(response.status, response.reason or "", response_headers, iterate(), conn)
 
 
 class _ModelListCache:
@@ -576,6 +465,91 @@ class _ModelListCache:
                 pass
 
 
+class _DeadlineReader:
+    def __init__(self, source: Any, connection: Any, deadline: float,
+                 max_timeout: float = _HANDLER_TIMEOUT,
+                 timeout_message: str = "client request deadline exceeded") -> None:
+        self.source = source
+        self.connection = connection
+        self.deadline = deadline
+        self.max_timeout = max_timeout
+        self.timeout_message = timeout_message
+        self.buffer = bytearray()
+        self.timed_out = False
+
+    def _fill(self, size: int) -> bool:
+        remaining = self.deadline - _now()
+        if remaining <= 0:
+            self.timed_out = True
+            raise TimeoutError(self.timeout_message)
+        self.connection.settimeout(min(self.max_timeout, remaining))
+        try:
+            chunk = self.source.read1(size)
+        except TimeoutError:
+            self.timed_out = True
+            raise
+        if not chunk:
+            return False
+        self.buffer.extend(chunk)
+        return True
+
+    def read1(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = 65536
+        if not self.buffer and not self._fill(size):
+            return b""
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise ValueError("request reads must have a size")
+        while len(self.buffer) < size:
+            if not self._fill(min(65536, size - len(self.buffer))):
+                break
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def readline(self, size: int = -1) -> bytes:
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0 and (size < 0 or newline + 1 <= size):
+                length = newline + 1
+                break
+            if size >= 0 and len(self.buffer) >= size:
+                length = size
+                break
+            read_size = 4096 if size < 0 else min(4096, size - len(self.buffer))
+            if not self._fill(max(1, read_size)):
+                length = len(self.buffer)
+                break
+        result = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        return result
+
+    def close(self) -> None:
+        self.source.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source, name)
+
+
+def _deadline_response_class(deadline: float) -> type[HTTPResponse]:
+    class _DeadlineHTTPResponse(HTTPResponse):
+        def __init__(self, sock: Any, *args: Any, **kwargs: Any) -> None:
+            super().__init__(sock, *args, **kwargs)
+            self.fp = cast(
+                Any,
+                _DeadlineReader(
+                    self.fp, sock, deadline, _UPSTREAM_HEADER_TIMEOUT, "upstream request deadline exceeded"
+                ),
+            )
+
+    return _DeadlineHTTPResponse
+
+
 class _HeaderLineReader:
     def __init__(self, source: Any, lines: list[bytes]) -> None:
         self.source, self.lines = source, lines
@@ -616,21 +590,41 @@ class _RouterHandler(BaseHTTPRequestHandler):
     server: _RouterServer
     rfile: Any
 
+    def setup(self) -> None:
+        super().setup()
+        self.rfile = _DeadlineReader(self.rfile, self.connection, _now() + _CLIENT_REQUEST_TIMEOUT)
+
     def log_message(self, format: str, *args: Any) -> None:
-        _LOG.debug("%s - %s", _log_text(self.address_string()), _log_text(format % args))
+        _LOG.debug("%s - %s", _log_text(self.client_address[0]), _log_text(format % args))
 
     def log_error(self, format: str, *args: Any) -> None:
-        _LOG.info("%s - %s", _log_text(self.address_string()), _log_text(format % args))
+        _LOG.info("%s - %s", _log_text(self.client_address[0]), _log_text(format % args))
+
+    def log_request(self, code: str | int = "-", size: str | int = "-") -> None:
+        _LOG.debug("%s - %s %s %s %s", _log_text(self.client_address[0]), _log_text(self.command),
+                   _log_text(_safe_log_path(self.path)), code, size)
 
     def handle_one_request(self) -> None:
         self._body_read = False
         try:
             super().handle_one_request()
+        except TimeoutError:
+            self._client_read_timed_out()
         except _CLIENT_DISCONNECT_ERRORS:
             self.close_connection = True
+        else:
+            if getattr(self.rfile, "timed_out", False):
+                self._client_read_timed_out()
         finally:
             if not self._body_read:
                 self._discard_body()
+
+    def _client_read_timed_out(self) -> None:
+        body_was_started = self._body_read
+        self._body_read = True
+        self.close_connection = True
+        if not body_was_started:
+            self._send_json(408, {"error": {"message": "request timed out"}})
 
     def _discard_body(self) -> None:
         """Consume a request body nobody read, so the close is a clean one.
@@ -678,7 +672,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
         if path is None:
             self._send_json(400, {"error": {"message": "invalid request target"}})
         elif path in {"/", "/health", "/-/ready", "/-/health"}:
-            self._send_json(200, {"status": "ok"})
+            self._send_json(200, {"status": "ok", "pid": os.getpid(), "token": self.server.instance_token})
         elif path == "/v1/models":
             if self._require_auth():
                 self._handle_models()
@@ -691,14 +685,32 @@ class _RouterHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "invalid request target"}})
             return
         path = urlsplit(target).path
-        if path in _POOLED_PATHS:
-            if self._require_auth():
-                self._handle_pooled(target)
-        elif path == "/v1/completions":
-            if self._require_auth():
-                self._handle_passthrough(target)
-        else:
+        if path not in _POOLED_PATHS | {"/v1/completions", "/-/shutdown"}:
             self._send_json(404, {"error": {"message": f"unknown path: {path}"}})
+            return
+        if not self._require_auth():
+            return
+        if path == "/-/shutdown":
+            token = self.headers.get("X-CX-Router-Token", "")
+            if not hmac.compare_digest(token.encode("utf-8"), self.server.instance_token.encode("ascii")):
+                self._send_json(409, {"error": {"message": "router instance changed"}})
+                return
+            self._send_json(202, {"status": "stopping"})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        body = self._read_body()
+        if body is None:
+            return
+        if not self.server.dispatch_slots.acquire(blocking=False):
+            self._send_json(503, {"error": {"message": "router: capacity exhausted"}})
+            return
+        try:
+            if path in _POOLED_PATHS:
+                self._handle_pooled(target, body)
+            else:
+                self._forward(target, body)
+        finally:
+            self.server.dispatch_slots.release()
 
     def _require_auth(self) -> bool:
         key = ROUTER_API_KEY.encode("utf-8")
@@ -738,10 +750,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
             return
         self._send_bytes(200, body)
 
-    def _handle_pooled(self, target: str) -> None:
-        body = self._read_body()
-        if body is None:
-            return
+    def _handle_pooled(self, target: str, body: bytes) -> None:
         try:
             payload = json.loads(body.decode("utf-8"), parse_constant=_reject_json_constant) if body else {}
         except (ValueError, RecursionError) as error:
@@ -760,146 +769,77 @@ class _RouterHandler(BaseHTTPRequestHandler):
         requested_model = model.strip()
         registry: _PoolRegistry = self.server.pools
         pool = registry.get(requested_model)
-        if pool is None:
-            self._forward_once(target, dict(self.headers), body)
-        else:
-            self._forward_pool(pool, target, payload)
+        self._forward(target, body, pool, payload)
 
-    def _forward_pool(self, pool: _Pool, path: str, payload: dict[str, Any]) -> None:
-        cooldowns: _CooldownTable = self.server.cooldowns
-        limiter: _RateLimiter = self.server.limiter
-        rotation: _Rotation = self.server.rotation
-        inflight: _InFlight = self.server.inflight
+    def _forward(self, path: str, body: bytes, pool: _Pool | None = None,
+                 payload: dict[str, Any] | None = None) -> None:
+        route = urlsplit(path).path
+        validate = route in _POOLED_PATHS
         request_id = uuid.uuid4().hex[:12]
         deadline = _now() + _POOL_REQUEST_TIMEOUT
-        size = len(pool.members)
-        start = rotation.cursor(pool.name, size)
-        distinct = len({member.model for member in pool.members})
         tried: set[str] = set()
         failures: list[dict[str, Any]] = []
-        attempt = 0
-        sweep = 1
+        attempt, sweep = 0, 1
+        direct_attempts = _DIRECT_ATTEMPTS if validate else 1
         while _now() < deadline:
-            if len(tried) >= distinct:
+            if pool is not None and len(tried) >= len(pool.members):
                 if sweep >= _POOL_PASSES:
                     break
-                pause = min(_SWEEP_BACKOFF * sweep, max(0.0, deadline - _now()))
-                if pause <= 0:
-                    break
-                time.sleep(pause)
+                time.sleep(min(_SWEEP_BACKOFF * sweep, max(0.0, deadline - _now())))
                 sweep += 1
                 tried.clear()
-            member = _pick_member(pool, cooldowns, tried, limiter, start, inflight,
-                                  rotation=rotation if not tried else None)
-            if member is None:
+            elif pool is None:
+                if attempt >= direct_attempts:
+                    break
+                if attempt:
+                    time.sleep(min(_DIRECT_BACKOFF * attempt, max(0.0, deadline - _now())))
+            if _now() >= deadline:
                 break
-            attempt += 1
-            tried.add(member.model)
-            rewritten = _rewrite_model(payload, member.model)
-            _LOG.info("request=%s attempt=%d pool=%s member=%s", request_id, attempt,
-                      _log_text(pool.name), _log_text(member.model))
-            with inflight.hold(member.model):
-                upstream, streamed = None, False
+            reservation = self.server.scheduler.hold(pool, tried) if pool is not None else nullcontext(None)
+            with reservation as member:
+                if pool is not None and member is None:
+                    break
+                attempt += 1
+                model = member.model if member is not None else None
+                if member is not None:
+                    tried.add(member.model)
+                outgoing = _rewrite_model(payload, member.model) if member is not None and payload is not None else body
+                upstream = None
+                committed = False
                 try:
-                    upstream = _forward_to_upstream(
-                        "POST", path, _upstream_headers(self.headers, rewritten), rewritten, deadline)
-                    verdict = _judge_response(upstream, path=urlsplit(path).path, deadline=deadline)
-                    if verdict is None:
-                        streamed = True
-                        if self._stream_upstream(upstream, request_id=request_id, member=member.model, deadline=deadline, path=urlsplit(path).path):
-                            cooldowns.clear(member.model)
-                        else:
-                            cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "stream_drop")
+                    upstream = _forward_to_upstream("POST", path, _upstream_headers(self.headers, outgoing), outgoing, deadline)
+                    verdict = _judge_response(upstream, path=route, deadline=deadline) if validate else None
+                    if verdict is None or verdict[0] == "terminal" or (pool is None and verdict[0] not in _INTEGRITY_FAILURES):
+                        committed = True
+                        clean = self._stream_upstream(upstream, request_id=request_id, member=model, deadline=deadline, path=route)
+                        if member is not None and verdict is None:
+                            if clean:
+                                self.server.runtime_state.clear(member.model)
+                            else:
+                                self.server.runtime_state.cooldown(member.model, _COOLDOWN_ON_NETERR)
                         return
                     category, delay = verdict
-                    if category == "rate_limit" and not _has_retry_after(upstream.headers):
+                    if member is not None and category == "rate_limit" and not _has_retry_after(upstream.headers):
                         delay = member.cooldown if member.cooldown is not None else (
-                            _COOLDOWN_ON_PACED_429 if member.limit is not None else delay
-                        )
-                    cooldowns.cooldown(member.model, delay, category)
-                    failures.append({"category": category, "status": upstream.status})
-                    _LOG.warning(
-                        "request=%s pool=%s member=%s status=%d category=%s cooldown=%.1fs",
-                        request_id, _log_text(pool.name), _log_text(member.model), upstream.status,
-                        category, delay,
-                    )
+                            _COOLDOWN_ON_PACED_429 if member.limit is not None else delay)
+                    status = upstream.status
                 except (OSError, HTTPException) as error:
-                    if streamed:
-                        _LOG.warning("request=%s member=%s client lost after commit: %s", request_id,
-                                     _log_text(member.model), _log_text(error))
+                    if committed:
                         return
-                    cooldowns.cooldown(member.model, _COOLDOWN_ON_NETERR, "network")
-                    failures.append({"category": "network", "status": None})
-                    _LOG.warning("request=%s pool=%s member=%s category=network error=%s", request_id,
-                                 _log_text(pool.name), _log_text(member.model), _log_text(error))
-                    continue
+                    category, delay, status = "network", _COOLDOWN_ON_NETERR, None
+                    _LOG.warning("request=%s member=%s category=network error=%s", request_id, _log_text(model), _log_text(error))
                 finally:
-                    if upstream is not None and not streamed:
+                    if upstream is not None:
                         upstream.close()
-        timed_out = _now() >= deadline
-        _LOG.warning("request=%s pool=%s exhausted attempts=%d sweeps=%d timed_out=%s", request_id,
-                     _log_text(pool.name), attempt, sweep, timed_out)
-        self._send_json(503, {"error": {
-            "message": "router: no pool member succeeded", "type": "pool_exhausted",
-            "request_id": request_id, "attempts": failures,
-        }})
-
-    def _handle_passthrough(self, target: str) -> None:
-        body = self._read_body()
-        if body is not None:
-            self._forward_once(target, dict(self.headers), body)
-
-    def _forward_once(self, path: str, headers: dict[str, str], body: bytes) -> None:
-        route_path = urlsplit(path).path
-        pooled = route_path in _POOLED_PATHS
-        attempts = _DIRECT_ATTEMPTS if pooled else 1
-        request_id = uuid.uuid4().hex[:12]
-        deadline = _now() + _POOL_REQUEST_TIMEOUT
-        failures: list[dict[str, Any]] = []
-        for attempt in range(1, attempts + 1):
-            if attempt > 1:
-                remaining = deadline - _now()
-                if remaining <= 0:
-                    break
-                if pause := min(_DIRECT_BACKOFF * (attempt - 1), remaining):
-                    time.sleep(pause)
-                _LOG.info("request=%s direct retry attempt=%d path=%s", request_id, attempt, _log_text(path))
-            upstream = None
-            try:
-                upstream = _forward_to_upstream("POST", path, _upstream_headers(headers, body), body, deadline)
-            except (OSError, HTTPException) as error:
-                failures.append({"category": "network", "status": None})
-                _LOG.warning("request=%s direct attempt=%d path=%s category=network error=%s",
-                             request_id, attempt, _log_text(path), _log_text(error))
-                continue
-            # A non-pooled path has no other member to try, so there is nothing to
-            # gain from judging the body: the upstream's answer is the answer, and
-            # re-reading a broken stream would only report what the client already
-            # saw. A pooled path is judged so a bad member can be left behind.
-            if not pooled:
-                self._stream_upstream(
-                    upstream, request_id=request_id,
-                    member=None,
-                    deadline=deadline, path=route_path)
-                return
-            verdict = _judge_response(upstream, path=route_path, deadline=deadline)
-            if verdict is None or verdict[0] not in _INTEGRITY_FAILURES:
-                self._stream_upstream(
-                    upstream, request_id=request_id,
-                    member=None,
-                    deadline=deadline, path=route_path)
-                return
-            upstream.close()
-            failures.append({"category": verdict[0], "status": upstream.status})
-            _LOG.warning("request=%s direct attempt=%d path=%s status=%d category=%s",
-                         request_id, attempt, _log_text(path), upstream.status, verdict[0])
-        category = failures[-1]["category"] if failures else "network"
-        _LOG.warning("request=%s direct path=%s exhausted attempts=%d category=%s",
-                     request_id, _log_text(path), len(failures), category)
-        message = "router: upstream unreachable" if category == "network" else "router: upstream response interrupted"
-        self._send_json(502, {"error": {
-            "message": message, "type": category,
-            "request_id": request_id, "attempts": failures,
+                if member is not None:
+                    self.server.runtime_state.cooldown(member.model, delay)
+                failures.append({"category": category, "status": status})
+                _LOG.warning("request=%s member=%s status=%s category=%s", request_id, _log_text(model), status, category)
+        category = "pool_exhausted" if pool is not None else (failures[-1]["category"] if failures else "network")
+        message = "router: no pool member succeeded" if pool is not None else (
+            "router: upstream unreachable" if category == "network" else "router: upstream response interrupted")
+        self._send_json(503 if pool is not None else 502, {"error": {
+            "message": message, "type": category, "request_id": request_id, "attempts": failures,
         }})
 
     def _read_body(self) -> bytes | None:
@@ -976,9 +916,6 @@ class _RouterHandler(BaseHTTPRequestHandler):
         return None
 
     def _send_bytes(self, status: int, body: bytes) -> None:
-        # The header alone does not stop the handler: BaseHTTPRequestHandler reads
-        # close_connection, not the header it wrote, and so would block on the next
-        # request line of a socket the peer is about to close.
         self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -1003,7 +940,6 @@ class _RouterHandler(BaseHTTPRequestHandler):
     def _stream_upstream(self, upstream: _UpstreamResponse, *, request_id: str | None = None,
                          member: str | None = None, deadline: float | None = None,
                          path: str = "/v1/messages") -> bool:
-        upstream.relax_timeout(deadline)
         streaming = _is_event_stream(upstream.headers)
         grammar = _grammar_for(path)
         try:
@@ -1023,10 +959,7 @@ class _RouterHandler(BaseHTTPRequestHandler):
                     _LOG.warning("request=%s member=%s upstream response exceeded cap", request_id, _log_text(member))
                     self._send_json(502, {"error": {"message": "router: upstream response too large"}})
                     return False
-                original_body = body
-                if member and not 400 <= upstream.status < 600:
-                    body = _attest_route(body, member)
-                if not self._send_upstream_headers(upstream, len(body), body != original_body):
+                if not self._send_upstream_headers(upstream, len(body)):
                     self._send_json(502, {"error": {"message": "router: invalid upstream headers"}})
                     return False
                 try:
@@ -1038,55 +971,48 @@ class _RouterHandler(BaseHTTPRequestHandler):
             if not self._send_upstream_headers(upstream, None):
                 self._send_json(502, {"error": {"message": "router: invalid upstream headers"}})
                 return False
-            sent, clean, has_content, terminal, saw_error = False, True, False, False, False
-            sse_buffer = b""
+            scan = upstream.scanner or _SseScan(grammar)
+            sent = False
             try:
-                for chunk in upstream.body_iter:
+                for chunk, inspect in chain(((c, False) for c in upstream.prefix),
+                                            ((c, True) for c in upstream.body_iter)):
+                    had_error = scan.saw_error
+                    if inspect:
+                        scan.feed(chunk)
+                    if scan.verdict is not None and scan.verdict[0] == "oversized":
+                        _LOG.warning("request=%s member=%s SSE frame exceeded cap", request_id, _log_text(member))
+                        self._write_sse_error()
+                        return False
                     try:
                         self.wfile.write(chunk)
                         self.wfile.flush()
                     except _CLIENT_DISCONNECT_ERRORS:
-                        _LOG.info("request=%s member=%s client disconnected after_bytes=%s", request_id,
-                                  _log_text(member), sent)
+                        _LOG.info("request=%s member=%s client disconnected after_bytes=%s", request_id, _log_text(member), sent)
                         return True
                     sent = True
-                    frames, sse_buffer = _split_sse_frames(sse_buffer + chunk)
-                    for frame in frames:
-                        event, payload = _sse_parts(frame)
-                        if grammar.has_content(event, payload):
-                            has_content = True
-                        if _sse_frame_is_error(frame):
-                            clean = False
-                            saw_error = True
-                            _LOG.warning("request=%s member=%s forwarded trailing SSE error", request_id, _log_text(member))
-                        if grammar.is_terminal(event):
-                            terminal = True
-                    if len(sse_buffer) > _MAX_SSE_FRAME_BYTES:
-                        _LOG.warning("request=%s member=%s SSE frame exceeded cap", request_id, _log_text(member))
-                        self._write_sse_error()
-                        return False
+                    if scan.saw_error and not had_error:
+                        _LOG.warning("request=%s member=%s forwarded trailing SSE error", request_id, _log_text(member))
             except (OSError, HTTPException, EOFError, zlib.error) as error:
                 _LOG.warning("request=%s member=%s upstream SSE interrupted after_bytes=%s: %s", request_id,
                              _log_text(member), sent, _log_text(error))
                 self._write_sse_error()
                 return False
-            if has_content and not terminal and not saw_error:
+            if scan.has_content and not scan.terminal and not scan.saw_error:
                 _LOG.warning("request=%s member=%s SSE ended without a terminal event", request_id, _log_text(member))
                 self._write_sse_error()
-                clean = False
-            return clean
+                return False
+            return not scan.saw_error
         finally:
             upstream.close()
 
-    def _send_upstream_headers(self, upstream: _UpstreamResponse, content_length: int | None,
-                               body_changed: bool = False) -> bool:
+    def _send_upstream_headers(self, upstream: _UpstreamResponse, content_length: int | None) -> bool:
         if any(not _valid_upstream_header(key, value) for key, value in upstream.headers):
             return False
         reason = _status_phrase(upstream.status, upstream.reason)
         self.send_response(upstream.status, reason if _valid_field_value(reason) else "")
         for key, value in upstream.headers:
             lower = key.lower()
-            if lower in _RESPONSE_IDENTITY_HEADERS or (body_changed and lower in _ENTITY_VALIDATORS):
+            if lower in _RESPONSE_IDENTITY_HEADERS:
                 continue
             self.send_header(key, value)
         if content_length is not None:
@@ -1097,7 +1023,6 @@ class _RouterHandler(BaseHTTPRequestHandler):
 
 
 _RESPONSE_IDENTITY_HEADERS = frozenset({"date", "server"})
-_ENTITY_VALIDATORS = frozenset({"content-md5", "digest", "etag"})
 
 
 def _valid_field_value(value: str) -> bool:
@@ -1121,42 +1046,6 @@ def _rewrite_model(parsed: dict[str, Any], real_model: str) -> bytes:
     payload = dict(parsed)
     payload["model"] = real_model
     return json.dumps(payload).encode("utf-8")
-
-
-def _attested_endpoint() -> str:
-    return http_url(ROUTER_HOST, ROUTER_PORT, "/v1")
-
-
-def _model_provider(model_id: object) -> str | None:
-    if not isinstance(model_id, str) or not model_id:
-        return None
-    parts = model_id.split("/")
-    if len(parts) == 2:
-        return parts[0] or None
-    if len(parts) >= 3:
-        return parts[1] or None
-    return None
-
-
-def _attest_route(body: bytes, member_model: str) -> bytes:
-    try:
-        parsed = json.loads(body)
-        if not isinstance(parsed, dict) or not parsed:
-            return body
-        if "model" not in parsed:
-            return body
-        payload = dict(parsed)
-        provider = _model_provider(payload.get("model")) \
-            or _model_provider(member_model)
-        if payload.get("provider") in (None, "") and provider:
-            payload["provider"] = provider
-        if payload.get("tier") in (None, "") and member_model.endswith(":free"):
-            payload["tier"] = "free"
-        if payload.get("endpoint") in (None, ""):
-            payload["endpoint"] = _attested_endpoint()
-        return json.dumps(payload).encode("utf-8")
-    except (ValueError, RecursionError):
-        return body
 
 
 def _upstream_headers(incoming: Any, body: bytes) -> dict[str, str]:
@@ -1206,14 +1095,6 @@ def _retry_after_seconds(headers: list[tuple[str, str]], default: float) -> floa
     return default
 
 
-def _split_sse_frames(buffer: bytes) -> tuple[list[bytes], bytes]:
-    frames = []
-    while match := _SSE_BOUNDARY.search(buffer):
-        frames.append(buffer[:match.start()])
-        buffer = buffer[match.end():]
-    return frames, buffer
-
-
 def _sse_parts(frame: bytes) -> tuple[str, Any]:
     event, data_lines = "", []
     for line in frame.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -1233,16 +1114,14 @@ def _sse_parts(frame: bytes) -> tuple[str, Any]:
     return event, payload
 
 
-def _sse_frame_is_error(frame: bytes) -> bool:
-    return _sse_parts(frame)[0] in _ERROR_EVENTS
-
-
 def _chat_delta_has_content(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    choice = next(iter(payload.get("choices") or ()), None)
-    delta = (choice or {}).get("delta") or {}
-    return any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls"))
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    delta = choices[0].get("delta")
+    return isinstance(delta, dict) and any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls"))
 
 
 @dataclass(frozen=True)
@@ -1293,50 +1172,63 @@ def _grammar_for(path: str) -> _Grammar:
     return _GRAMMARS.get(route.removesuffix("/count_tokens"), _ANTHROPIC_GRAMMAR)
 
 
+class _SseScan:
+    def __init__(self, grammar: _Grammar) -> None:
+        self.grammar = grammar
+        self.buffer = b""
+        self.has_content = False
+        self.terminal = False
+        self.saw_error = False
+        self.verdict: tuple[str, float] | None = None
+
+    def feed(self, chunk: bytes, *, stop_at_content: bool = False) -> bytes:
+        self.buffer += chunk
+        while match := _SSE_BOUNDARY.search(self.buffer):
+            frame, self.buffer = self.buffer[:match.start()], self.buffer[match.end():]
+            if len(frame) > _MAX_SSE_FRAME_BYTES:
+                self.verdict = "oversized", _COOLDOWN_ON_5XX
+                return b""
+            event, payload = _sse_parts(frame)
+            self.saw_error |= event in _ERROR_EVENTS
+            self.terminal |= self.grammar.is_terminal(event)
+            if self.verdict is None and not self.has_content:
+                if self.grammar.has_content(event, payload):
+                    self.has_content = True
+                    if stop_at_content:
+                        remainder, self.buffer = self.buffer, b""
+                        return remainder
+                elif event in self.grammar.verdicts:
+                    self.verdict = self.grammar.verdicts[event]
+        if len(self.buffer) > _MAX_SSE_FRAME_BYTES:
+            self.verdict = "oversized", _COOLDOWN_ON_5XX
+        return b""
+
+
 def _validate_stream_head(upstream: _UpstreamResponse, deadline: float,
                           grammar: _Grammar) -> tuple[str, float] | None:
-    iterator, chunks, buffered, total = iter(upstream.body_iter), [], b"", 0
-    outcome: tuple[str, float] | None = None
-    has_content = False
+    iterator, chunks, total = iter(upstream.body_iter), [], 0
+    scan = _SseScan(grammar)
     try:
         while total < _HEAD_PEEK_BYTES and _now() < deadline:
             chunk = next(iterator)
             chunks.append(chunk)
             total += len(chunk)
-            buffered += chunk
-            frames, buffered = _split_sse_frames(buffered)
-            for frame in frames:
-                if len(frame) > _MAX_SSE_FRAME_BYTES:
-                    outcome = "oversized", _COOLDOWN_ON_5XX
-                    break
-                event, payload = _sse_parts(frame)
-                if grammar.has_content(event, payload):
-                    has_content = True
-                    break
-                if event in grammar.verdicts:
-                    outcome = grammar.verdicts[event]
-                    break
-            if outcome is not None or has_content:
-                break
-            if len(buffered) > _MAX_SSE_FRAME_BYTES:
-                outcome = "oversized", _COOLDOWN_ON_5XX
-                break
-            if total >= _HEAD_PEEK_BYTES:
-                outcome = "empty", _COOLDOWN_ON_EMPTY
+            remainder = scan.feed(chunk, stop_at_content=True)
+            if remainder:
+                chunks[-1] = chunk[:-len(remainder)]
+                iterator = chain((remainder,), iterator)
+            if scan.verdict is not None or scan.has_content:
                 break
     except StopIteration:
-        outcome = outcome or ("empty", _COOLDOWN_ON_EMPTY)
+        pass
     except (OSError, HTTPException, EOFError, zlib.error):
-        outcome = "truncated", _COOLDOWN_ON_NETERR
-    if outcome is None and not has_content:
-        outcome = "empty", _COOLDOWN_ON_EMPTY
-    upstream.body_iter = chain(chunks, iterator)
-    return outcome
+        return "truncated", _COOLDOWN_ON_NETERR
+    upstream.prefix, upstream.body_iter, upstream.scanner = tuple(chunks), iterator, scan
+    return scan.verdict or (None if scan.has_content else _EMPTY)
 
 
 def _validate_body(upstream: _UpstreamResponse, path: str,
                    grammar: _Grammar, deadline: float) -> tuple[str, float] | None:
-    upstream.relax_timeout(deadline)
     try:
         body = _read_bounded_body(upstream)
     except (OSError, HTTPException, EOFError, zlib.error):
@@ -1361,15 +1253,7 @@ def _validate_body(upstream: _UpstreamResponse, path: str,
 
 
 def _judge_response(upstream: _UpstreamResponse, *, path: str, deadline: float) -> tuple[str, float] | None:
-    """Name the failure and say how long the member is out, or None if it is sound.
-
-    A member that fails is a member to leave: the next one may well serve the
-    request, and stopping at the first refusal lets one member that rejects a
-    capability take the whole pool down. The response only decides the label and
-    the cooldown; whether to keep going is the caller's, and for a pool it always
-    is. A 2xx the grammar accepts is the one answer that is not a failure, which
-    is why this is not a failure count.
-    """
+    """Classify the response before the caller commits it to the client."""
     if 200 <= upstream.status < 300:
         grammar = _grammar_for(path)
         if _is_event_stream(upstream.headers):
@@ -1379,6 +1263,8 @@ def _judge_response(upstream: _UpstreamResponse, *, path: str, deadline: float) 
         return "rate_limit", _retry_after_seconds(upstream.headers, _COOLDOWN_ON_429_DEFAULT)
     if upstream.status in _AUTH_STATUS:
         return "auth", _COOLDOWN_ON_AUTH
+    if 400 <= upstream.status < 500 and upstream.status not in {404, 408, 409, 425}:
+        return "terminal", 0.0
     return "upstream", _COOLDOWN_ON_5XX
 
 
@@ -1398,27 +1284,36 @@ def _read_bounded_body(upstream: _UpstreamResponse) -> bytes | None:
 
 
 class _RouterServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+    daemon_threads = False
+    allow_reuse_address = sys.platform != "win32"
+
+    def __init__(self, address: tuple[str, int], *, state_path: Path | None = None) -> None:
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
+        self.dispatch_slots = threading.BoundedSemaphore(_MAX_ACTIVE_REQUESTS)
+        self.instance_token = secrets.token_urlsafe(32)
+        self.runtime_state = RouterState(state_path, monotonic_time=lambda: _now())
+        try:
+            super().__init__(address, _RouterHandler)
+        except BaseException:
+            self.runtime_state.close()
+            raise
+        self.pools = _PoolRegistry(POOLS_FILE)
+        self.scheduler = _Scheduler(self.runtime_state)
+        self.models_cache = _ModelListCache()
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self.runtime_state.close()
 
     def server_bind(self) -> None:
-        # HTTPServer.server_bind resolves the host name between bind() and
-        # listen(). A reverse-DNS lookup that stalls there holds the port bound
-        # but unserved, and the launcher's health check then fails for reasons
-        # that name no resolver. The router never serves a name, so skip it.
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         socketserver.TCPServer.server_bind(self)
         host = self.server_address[0]
         self.server_name = host.decode() if isinstance(host, (bytes, bytearray)) else host
         self.server_port = self.server_address[1]
-
-    def __init__(self, address: tuple[str, int]) -> None:
-        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
-        super().__init__(address, _RouterHandler)
-        self.pools = _PoolRegistry(POOLS_FILE)
-        self.cooldowns, self.limiter = _CooldownTable(), _RateLimiter()
-        self.rotation, self.models_cache = _Rotation(), _ModelListCache()
-        self.inflight = _InFlight()
-
 
 def _wait_upstream(deadline: float) -> None:
     while _now() < deadline:
@@ -1468,13 +1363,19 @@ def run_forever() -> int:
     _LOG.info("router starting on %s, forwarding to %s",
               http_url(ROUTER_HOST, ROUTER_PORT), http_url(PROXY_HOST, PROXY_PORT))
     _wait_upstream(_now() + ROUTER_START_TIMEOUT)
-    server = _RouterServer((ROUTER_HOST, ROUTER_PORT))
+    server = _RouterServer((ROUTER_HOST, ROUTER_PORT), state_path=ROUTER_STATE_FILE)
+    identity = None
     try:
-        server.serve_forever(poll_interval=0.5)
+        identity = publish_router_identity(os.getpid(), server.instance_token)
+        server.serve_forever(poll_interval=0.05)
     except KeyboardInterrupt:
         _LOG.info("router stopping (KeyboardInterrupt)")
     finally:
-        server.server_close()
+        try:
+            server.server_close()
+        finally:
+            if identity is not None:
+                clear_router_identity(identity)
     return 0
 
 

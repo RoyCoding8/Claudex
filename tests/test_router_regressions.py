@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import logging
+import os
 import socket
 import socketserver
 import struct
@@ -28,8 +29,6 @@ from modules import config, router_starter
 from modules.pools import ModelPool, PoolMember, _atomic_publish, load_pools
 from modules.router import (
     _SWEEP_BACKOFF,
-    _UPSTREAM_TIMEOUT,
-    _grammar_for,
     _ModelListCache,
     _parse_pools,
     _PoolRegistry,
@@ -37,7 +36,6 @@ from modules.router import (
     _RouterServer,
     _upstream_headers,
     _UpstreamResponse,
-    _validate_body,
     run_forever,
 )
 from tests.test_router import (
@@ -62,7 +60,6 @@ class ServerLifecycleTests(unittest.TestCase):
     def test_server_can_rebind_immediately_after_close(self) -> None:
         router = _RouterServer(("127.0.0.1", 0))
         address = router.server_address
-        self.assertTrue(router.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR))
         router.server_close()
         rebound = _RouterServer(address)
         try:
@@ -299,30 +296,21 @@ class ServerIdentityTests(unittest.TestCase):
             body = response.read()
             connection.close()
         self.assertEqual(server, f"{config.ROUTER_IDENTITY} ")
-        self.assertEqual(json.loads(body), {"status": "ok"})
+        self.assertEqual(json.loads(body), {"status": "ok", "pid": os.getpid(), "token": router.instance_token})
 
     def test_the_starters_readiness_probe_accepts_the_reduced_server_header(self) -> None:
         with _running_router((200, {}, _OK_BODY)) as router, \
              patch.object(router_starter, "ROUTER_HOST", "127.0.0.1"), \
              patch.object(router_starter, "ROUTER_PORT", router.server_port):
-            self.assertTrue(router_starter._health_check())
+            self.assertTrue(router_starter._health_check(router_starter.RouterIdentity(os.getpid(), router.instance_token)))
 
 
 class IPv6AuthorityTests(unittest.TestCase):
-    def test_attested_endpoint_uses_bracketed_ipv6_router_authority(self) -> None:
-        response = b'{"model":"provider/first","content":[{"type":"text","text":"ok"}]}'
-        with patch("modules.router.ROUTER_HOST", "::1"), patch("modules.router.ROUTER_PORT", 4000), \
-                _running_router((200, {}, response)) as router:
-            status, body = _post(router)
-
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["endpoint"], "http://[::1]:4000/v1")
-
     def test_upstream_host_uses_bracketed_ipv6_without_bracketing_socket_target(self) -> None:
         upstream = _IPv6UpstreamServer(("::1", 0), _IPv6UpstreamHandler)
         upstream.state = types.SimpleNamespace(
             responses=deque([(200, {}, _OK_BODY)]), models=[], paths=[], hosts=[],
-            stream_gate=threading.Event(),
+            request_started=threading.Event(), stream_gate=threading.Event(),
         )
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         upstream_thread.start()
@@ -362,6 +350,8 @@ class IPv6AuthorityTests(unittest.TestCase):
 
     def test_the_startup_log_brackets_an_ipv6_host(self) -> None:
         class Server:
+            instance_token = "test-instance-token"
+
             def serve_forever(self, **kwargs: object) -> None:
                 pass
 
@@ -372,6 +362,8 @@ class IPv6AuthorityTests(unittest.TestCase):
              patch("modules.router.ROUTER_HOST", "::1"), patch("modules.router.ROUTER_PORT", 4000), \
              patch("modules.router.PROXY_HOST", "::2"), patch("modules.router.PROXY_PORT", 8317), \
              patch("modules.router._wait_upstream"), \
+             patch("modules.router.publish_router_identity"), \
+             patch("modules.router.clear_router_identity"), \
              patch("modules.router._RouterServer", return_value=Server()), \
              self.assertLogs(router_module._LOG, level="INFO") as captured:
             self.assertEqual(run_forever(), 0)
@@ -379,8 +371,8 @@ class IPv6AuthorityTests(unittest.TestCase):
                       "\n".join(captured.output))
 
 
-class ResponseAttestationTests(unittest.TestCase):
-    def test_mutated_body_drops_stale_entity_validators(self) -> None:
+class ResponseHeaderTests(unittest.TestCase):
+    def test_unchanged_body_preserves_entity_validators(self) -> None:
         body = b'{"model":"provider/first","content":[{"type":"text","text":"ok"}]}'
         with _running_router((200, {
             "Content-MD5": "old-md5",
@@ -390,9 +382,9 @@ class ResponseAttestationTests(unittest.TestCase):
             status, headers, received = _completions_post(
                 router, b'{"model":"test-pool","messages":[]}', "/v1/messages")
         self.assertEqual(status, 200)
-        self.assertNotEqual(received, body)
+        self.assertEqual(received, body)
         for name in ("content-md5", "digest", "etag"):
-            self.assertNotIn(name, headers)
+            self.assertIn(name, headers)
 
     def test_unchanged_weak_etag_survives_passthrough(self) -> None:
         with _running_router((400, {"ETag": 'W/"stable"'}, b'{"error":"bad"}')) as router:
@@ -410,11 +402,7 @@ class ResponseAttestationTests(unittest.TestCase):
             with self.subTest(path=path), _running_router((status_code, {}, body)) as router:
                 received_status, received_body = _post(router, path, model=model)
             if model == "test-pool":
-                # A refusal is a member failure, so the pool is swept and the
-                # client is told the pool failed rather than handed one member's
-                # body as though it were the answer.
-                self.assertEqual(received_status, 503)
-                self.assertNotIn(b"content", received_body)
+                self.assertEqual((received_status, received_body), (status_code, body))
             else:
                 self.assertEqual((received_status, received_body), (status_code, body))
 
@@ -527,7 +515,7 @@ class RequestBodyBoundaryTests(unittest.TestCase):
             self.assertEqual(json.loads(state.request_bodies[0])["note"], note)
 
 
-class ResponseBodyAttestationBoundaryTests(unittest.TestCase):
+class ResponseBodyPreservationTests(unittest.TestCase):
     def _script(self, body: bytes) -> bytes:
         return (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
                 + str(len(body)).encode() + b"\r\n\r\n" + body)
@@ -536,7 +524,7 @@ class ResponseBodyAttestationBoundaryTests(unittest.TestCase):
         return _raw_responses(router, _direct_post(
             b"/v1/messages", b'{"model":"test-pool","messages":[]}'))
 
-    def test_unencodable_upstream_text_is_still_attested(self) -> None:
+    def test_upstream_text_is_preserved_without_reencoding(self) -> None:
         for label, text in (("lone_surrogate", "\ud800"), ("non_ascii", "héllo — 世界")):
             with self.subTest(text=label):
                 body = json.dumps({"model": "provider/first", "type": "message",
@@ -545,11 +533,7 @@ class ResponseBodyAttestationBoundaryTests(unittest.TestCase):
                 with _running_raw_upstream(self._script(body)) as (router, _):
                     responses = self._post_pooled(router)
                 self.assertEqual(len(responses), 1)
-                attested = json.loads(responses[0][1])
-                self.assertEqual(attested["content"], [{"type": "text", "text": text}])
-                self.assertEqual(attested["provider"], "provider")
-                self.assertEqual(attested["endpoint"],
-                                 f"http://127.0.0.1:{router_module.ROUTER_PORT}/v1")
+                self.assertEqual(responses[0], (200, body))
 
 
 class StreamHeadDeadlineTests(unittest.TestCase):
@@ -565,7 +549,7 @@ class StreamHeadDeadlineTests(unittest.TestCase):
                 b"/v1/messages", b'{"model":"test-pool","messages":[]}'))
         self.assertEqual([status for status, _ in responses], [503])
         self.assertFalse(b"text/event-stream" in responses[0][1])
-        self.assertFalse(router.cooldowns.is_ready("provider/first"))
+        self.assertFalse(router.runtime_state.is_ready("provider/first"))
         self.assertEqual(len(state.request_lines), 1)
 
     def test_a_stream_head_that_lands_content_still_validates(self) -> None:
@@ -585,7 +569,7 @@ class StreamHeadDeadlineTests(unittest.TestCase):
         self.assertIn(b"event: content_block_delta", body)
         self.assertIn(b"event: message_stop", body)
         self.assertNotIn(b"upstream stream interrupted", body)
-        self.assertTrue(router.cooldowns.is_ready("provider/first"))
+        self.assertTrue(router.runtime_state.is_ready("provider/first"))
 
 
 class UpstreamStatusLineTests(unittest.TestCase):
@@ -761,10 +745,10 @@ class PostCommitTests(unittest.TestCase):
             connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             connection.close()
             deadline = time.monotonic() + 2.0
-            while router.inflight.count("provider/first") and time.monotonic() < deadline:
+            while router.scheduler.count("provider/first") and time.monotonic() < deadline:
                 time.sleep(0.05)
         self.assertEqual(router.upstream_state.models, ["provider/first"])
-        self.assertTrue(router.cooldowns.is_ready("provider/first"))
+        self.assertTrue(router.runtime_state.is_ready("provider/first"))
 
 
 class AuthHardeningTests(unittest.TestCase):
@@ -861,8 +845,8 @@ class AuthHardeningTests(unittest.TestCase):
                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         with _running_router((200, {}, _OK_BODY), (200, {}, _OK_BODY)) as router:
             self.assertEqual(_raw_responses(router, request), [(401, b'{"error": {"message": "invalid api key"}}')])
-        self.assertTrue(router.cooldowns.is_ready("provider/first"))
-        self.assertTrue(router.cooldowns.is_ready("provider/second"))
+        self.assertTrue(router.runtime_state.is_ready("provider/first"))
+        self.assertTrue(router.runtime_state.is_ready("provider/second"))
         self.assertEqual(router.upstream_state.models, [])
 
 
@@ -1085,6 +1069,8 @@ class PoolReloadBoundaryTests(unittest.TestCase):
 class EntrypointTests(unittest.TestCase):
     def test_run_forever_stops_on_configuration_errors(self) -> None:
         class Server:
+            instance_token = "test-instance-token"
+
             def serve_forever(self, **kwargs: object) -> None:
                 pass
 
@@ -1251,31 +1237,96 @@ class ResponseEntrypointTests(unittest.TestCase):
         self.assertIn(b"model response too large", received)
 
 
-class _FakeBodySocket:
-    def __init__(self) -> None:
-        self.timeout: float | None = None
-
-    def settimeout(self, value: float) -> None:
-        self.timeout = value
-
-
 class TimeoutTests(unittest.TestCase):
-    def test_the_upstream_socket_never_outlives_the_request_deadline(self) -> None:
-        def validate(response, deadline):
-            return _validate_body(
-                response, "/v1/messages", _grammar_for("/v1/messages"), deadline)
+    def test_reader_clamps_each_read_to_one_absolute_deadline(self) -> None:
+        clock = [10.0]
+        timeouts = []
 
-        for label, exercise in (("relax_timeout", lambda r, d: r.relax_timeout(deadline=d)),
-                                ("body_validation", validate)):
-            with self.subTest(entry=label):
-                fake = _FakeBodySocket()
-                response = _UpstreamResponse(
-                    200, "OK", [], iter((_OK_BODY,)), _StubConn(), body_socket=fake)
-                deadline = time.monotonic() + 5.0
-                self.assertIsNone(exercise(response, deadline))
-                self.assertIsNotNone(fake.timeout)
-                self.assertLessEqual(fake.timeout, 5.0)
-                self.assertLess(fake.timeout, _UPSTREAM_TIMEOUT)
+        class Source:
+            def read1(self, size):
+                clock[0] += 0.4
+                return b"x"
+
+        connection = types.SimpleNamespace(settimeout=timeouts.append)
+        reader = router_module._DeadlineReader(Source(), connection, 11.0)
+        with patch.object(router_module, "_now", side_effect=lambda: clock[0]):
+            self.assertEqual([reader.read1(1) for _ in range(3)], [b"x"] * 3)
+            with self.assertRaises(TimeoutError):
+                reader.read1(1)
+        self.assertEqual(len(timeouts), 3)
+        for actual, expected in zip(timeouts, [1.0, 0.6, 0.2], strict=True):
+            self.assertAlmostEqual(actual, expected)
+        self.assertTrue(reader.timed_out)
+
+    def test_slow_drip_request_body_uses_one_client_deadline(self) -> None:
+        payload = b'{"model":"test-pool","messages":[]}'
+        request_head = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Authorization: Bearer test-router-key\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+        )
+        with _running_router() as router, patch("modules.router._CLIENT_REQUEST_TIMEOUT", 0.08):
+            connection = socket.create_connection(("127.0.0.1", router.server_port), timeout=2)
+            started = time.monotonic()
+            connection.sendall(request_head + payload[:1])
+            time.sleep(0.05)
+            connection.sendall(payload[1:2])
+            time.sleep(0.05)
+            try:
+                connection.sendall(payload[2:])
+            except OSError:
+                pass
+            response = b""
+            try:
+                while chunk := connection.recv(4096):
+                    response += chunk
+            except OSError:
+                pass
+            elapsed = time.monotonic() - started
+            connection.close()
+
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(router.upstream_state.models, [])
+
+    def test_slow_drip_request_headers_receive_408(self) -> None:
+        request = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        with _running_router() as router, patch("modules.router._CLIENT_REQUEST_TIMEOUT", 0.08):
+            connection = socket.create_connection(("127.0.0.1", router.server_port), timeout=2)
+            started = time.monotonic()
+            connection.sendall(request)
+            response = b""
+            while chunk := connection.recv(4096):
+                response += chunk
+            elapsed = time.monotonic() - started
+            connection.close()
+
+        self.assertTrue(response.startswith(b"HTTP/1.1 408"), response[:80])
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(router.upstream_state.models, [])
+
+    def test_upstream_response_headers_share_the_absolute_pool_deadline(self) -> None:
+        with _running_router((200, {}, _OK_BODY)) as router:
+            router.upstream_state.response_delay = 0.3
+            started = time.monotonic()
+            with patch("modules.router._POOL_REQUEST_TIMEOUT", 0.08):
+                status, _ = _post(router)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(status, 503)
+        self.assertLess(elapsed, 2.0)
+
+    def test_slow_drip_upstream_headers_cannot_extend_the_deadline(self) -> None:
+        with _running_router((200, {"Content-Type": "application/json"}, _OK_BODY)) as router:
+            router.upstream_state.header_delay = 0.04
+            started = time.monotonic()
+            with patch("modules.router._POOL_REQUEST_TIMEOUT", 0.08):
+                status, _ = _post(router)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(status, 503)
+        self.assertLess(elapsed, 2.0)
 
 
 def _raw_post(router: _RouterServer, request: bytes) -> tuple[int, bytes]:
@@ -1790,7 +1841,8 @@ class RotationTests(unittest.TestCase):
         ) as router:
             status, _ = _post(router)
             self.assertEqual(status, 503)
-            self.assertEqual(router.rotation.cursor("test-pool", 3), 1)
+            self.assertEqual(_post(router)[0], 503)
+        self.assertEqual(router.upstream_state.models[:4], ["provider/first", "provider/second", "provider/third", "provider/second"])
 
     def test_duplicate_member_does_not_stall_rotation(self):
         members = [{"model": "provider/first", "priority": 0},
@@ -1828,10 +1880,10 @@ class ResponseCapTests(unittest.TestCase):
             status, body = _post(router)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), json.loads(_OK_BODY))
-        self.assertFalse(router.cooldowns.is_ready("provider/first"))
+        self.assertFalse(router.runtime_state.is_ready("provider/first"))
 
     def test_forwarded_error_and_passthrough_bodies_use_cap(self) -> None:
-        cases = (("/v1/messages", "test-pool", 400, 503),
+        cases = (("/v1/messages", "test-pool", 400, 502),
                  ("/v1/completions", "provider/direct", 500, 502))
         for path, model, upstream_status, expected_status in cases:
             with self.subTest(path=path), patch("modules.router._MAX_RESPONSE_BYTES", 4096), _running_router(
@@ -1840,14 +1892,11 @@ class ResponseCapTests(unittest.TestCase):
                 status, body = _post(router, path, model=model)
             self.assertEqual(status, expected_status)
             self.assertNotIn(b"x" * 100, body)
-        # The refusal is a member failure, so the pool is swept rather than one
-        # member's oversized body being handed on as the answer.
         with patch("modules.router._MAX_RESPONSE_BYTES", 4096), _running_router(
             *[(400, {}, b"x" * 9999)] * 4
         ) as router:
-            self.assertEqual(_post(router, "/v1/messages", model="test-pool")[0], 503)
-            self.assertCountEqual(
-                router.upstream_state.models, ["provider/first", "provider/second"] * 2)
+            self.assertEqual(_post(router, "/v1/messages", model="test-pool")[0], 502)
+            self.assertEqual(router.upstream_state.models, ["provider/first"])
 
 
 class DirectPathTests(unittest.TestCase):
@@ -1914,17 +1963,6 @@ class DirectPathTests(unittest.TestCase):
             self.assertEqual(status, upstream_status)
             self.assertEqual(received, body)
             self.assertEqual(router.upstream_state.models, ["provider/direct"])
-
-
-class StopRouterTests(unittest.TestCase):
-    def test_stop_router_reports_failure_when_port_remains_open(self):
-        # _kill_router is not stubbed, so pid 123 must be inert for the test to be safe.
-        with patch.object(router_starter, "_read_pid", return_value=123), \
-             patch.object(router_starter, "_terminate_router", return_value=True), \
-             patch.object(router_starter, "_stop_router_process"), \
-             patch.object(router_starter, "_port_is_open", return_value=True), \
-             patch.object(router_starter, "_STOP_TIMEOUT", 0.3):
-            self.assertIs(router_starter.stop_router(), router_starter.StopOutcome.REFUSED)
 
 
 if __name__ == "__main__":

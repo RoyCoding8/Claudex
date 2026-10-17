@@ -15,24 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import process
 from .config import POOLS_EXAMPLE_FILE, POOLS_FILE
 from .models import Model
-
-fcntl_module: Any
-try:
-    import fcntl
-except ImportError:
-    fcntl_module = None
-else:
-    fcntl_module = fcntl
-
-msvcrt_module: Any
-try:
-    import msvcrt
-except ImportError:
-    msvcrt_module = None
-else:
-    msvcrt_module = msvcrt
 
 _LOG = logging.getLogger("cx.pools")
 _LOADED_DIGESTS: dict[Path, str] = {}
@@ -59,28 +44,14 @@ def _canonical_path(path: Path) -> Path:
 @contextmanager
 def _pool_file_lock(path: Path) -> Iterator[None]:
     path = _canonical_path(path)
-    lock_path = path.with_name(f".{path.name}.lock")
     with _SAVE_LOCK:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as handle:
-            if fcntl_module is not None:
-                fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_UN)
-            elif msvcrt_module is not None:
-                # No primer byte: msvcrt refuses a read of a locked range, so
-                # priming made an ordinary wait surface as PermissionError.
-                handle.seek(0)
-                msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    handle.seek(0)
-                    msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_UNLCK, 1)
-            else:
-                raise RuntimeError("Pool persistence requires an interprocess file-lock primitive.")
+        handle = process.lock_file(path.with_name(f".{path.name}.lock"), blocking=True)
+        if handle is None:
+            raise RuntimeError("Could not acquire the pool configuration lock.")
+        try:
+            yield
+        finally:
+            handle.close()
 
 
 def _digest(text: str) -> str:
@@ -340,52 +311,37 @@ def _present(**fields: Any) -> dict[str, Any]:
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def _validate_optional_int(value: Any, field: str, name: str, minimum: int) -> None:
-    if value is None:
-        return
-    if type(value) is not int:
-        raise ValueError(f"Pool {name!r} {field} must be an integer.")
-    if value < minimum or value > _MAX_INTEGER:
-        raise ValueError(f"Pool {name!r} {field} must be between {minimum} and {_MAX_INTEGER}.")
+def _pool_document(pools: list[ModelPool]) -> dict[str, Any]:
+    return {"version": _SUPPORTED_VERSION, "pools": [
+        {"name": pool.name.strip(), "enabled": pool.enabled,
+         **({"strategy": pool.strategy} if pool.strategy != STRATEGIES[0] else {}),
+         "members": [
+            {"model": member.model.strip(),
+             **_present(rpm=member.rpm, priority=member.priority,
+                        limit=member.limit, cooldown=member.cooldown)}
+            for member in pool.members
+        ]}
+        for pool in pools
+    ]}
 
 
-def _validate_pools_for_save(pools: list[ModelPool]) -> None:
-    names: set[str] = set()
-    for pool in pools:
-        if not isinstance(pool.name, str) or not pool.name.strip():
-            raise ValueError("Pool name must not be blank.")
-        if type(pool.enabled) is not bool:
-            raise ValueError(f"Pool {pool.name!r} enabled must be a boolean.")
-        if not isinstance(pool.strategy, str) or pool.strategy not in STRATEGIES:
-            raise ValueError(f"Pool {pool.name!r} strategy must be one of {', '.join(STRATEGIES)}.")
-        name = pool.name.strip()
-        if name in names:
-            raise ValueError(f"Duplicate pool name {name!r}.")
-        names.add(name)
-        if not isinstance(pool.members, (tuple, list)) or not pool.members:
-            raise ValueError(f"Pool {name!r} must have at least one member.")
-        members: set[str] = set()
-        for member in pool.members:
-            if not isinstance(member, PoolMember):
-                raise ValueError(f"Pool {name!r} has an invalid member.")
-            if not isinstance(member.model, str) or not member.model.strip():
-                raise ValueError(f"Pool {name!r} member model must not be blank.")
-            model = member.model.strip()
-            if model in members:
-                raise ValueError(f"Duplicate member {model!r} in pool {name!r}.")
-            members.add(model)
-            _validate_optional_int(member.rpm, "rpm", name, 1)
-            _validate_optional_int(member.priority, "priority", name, 0)
-            _validate_optional_int(member.limit, "limit", name, 1)
-            if member.cooldown is not None:
-                if type(member.cooldown) not in (int, float):
-                    raise ValueError(f"Pool {name!r} cooldown must be a number.")
-                try:
-                    cooldown = float(member.cooldown)
-                except (TypeError, ValueError, OverflowError) as error:
-                    raise ValueError(f"Pool {name!r} cooldown must be a number.") from error
-                if not math.isfinite(cooldown) or cooldown <= 0:
-                    raise ValueError(f"Pool {name!r} cooldown must be finite and greater than zero.")
+def _serialize_pools(pools: list[ModelPool], upstream_models: list[Model] | None) -> str:
+    try:
+        payload = _pool_document(pools)
+        normalized = [ModelPool(p.name.strip(), tuple(
+            PoolMember(m.model.strip(), m.rpm, m.priority, m.limit, m.cooldown) for m in p.members
+        ), p.enabled, p.strategy) for p in pools]
+    except (AttributeError, TypeError) as error:
+        raise ValueError("Invalid pool or member structure.") from error
+    parsed, warnings = parse_pool_document(payload)
+    if parsed != normalized:
+        raise ValueError("Invalid pool configuration: " + "; ".join(warnings))
+    if upstream_models is not None:
+        validate_pools_against_models(parsed, upstream_models)
+    body = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    if len(body.encode("utf-8")) > _MAX_POOL_FILE_BYTES:
+        raise ValueError(f"serialized pool configuration exceeds {_MAX_POOL_FILE_BYTES} bytes")
+    return body
 
 
 def _read_current_digest(path: Path) -> tuple[bool, str]:
@@ -478,23 +434,7 @@ def save_pools(
     upstream_models: list[Model] | None = None,
 ) -> str:
     """Atomically publish a save with best-effort conflict detection. Returns the digest now on disk."""
-    _validate_pools_for_save(pools)
-    if upstream_models is not None:
-        validate_pools_against_models(pools, upstream_models)
-    payload = {"version": _SUPPORTED_VERSION, "pools": [
-        {"name": pool.name.strip(), "enabled": pool.enabled,
-         **({"strategy": pool.strategy} if pool.strategy != STRATEGIES[0] else {}),
-         "members": [
-            {"model": member.model.strip(),
-             **_present(rpm=member.rpm, priority=member.priority,
-                        limit=member.limit, cooldown=member.cooldown)}
-            for member in pool.members
-        ]}
-        for pool in pools
-    ]}
-    body = json.dumps(payload, indent=2, allow_nan=False) + "\n"
-    if len(body.encode("utf-8")) > _MAX_POOL_FILE_BYTES:
-        raise ValueError(f"serialized pool configuration exceeds {_MAX_POOL_FILE_BYTES} bytes")
+    body = _serialize_pools(pools, upstream_models)
     path = _canonical_path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
