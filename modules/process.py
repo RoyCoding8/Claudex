@@ -21,6 +21,15 @@ _POLL_INTERVAL = 0.2
 _CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", errno.EAGAIN)})
 
 
+class PortOccupiedError(RuntimeError):
+    """A port we need is held by a process we cannot verify or control."""
+
+    def __init__(self, host: str, port: int) -> None:
+        super().__init__(f"Port {port} on {host} is occupied by an unverified or unresponsive process.")
+        self.host = host
+        self.port = port
+
+
 def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
@@ -107,6 +116,37 @@ def port_is_open(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def kill_port_occupant(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Kill whatever listens on host:port. False when the port stays occupied."""
+    if not 1 <= port <= 65535:
+        return False
+    if sys.platform == "win32":
+        lookup = subprocess.run(
+            ["netstat", "-aon", "-p", "TCP"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        )
+        if lookup.returncode != 0:
+            return False
+        suffix = f":{port}"
+        for line in lookup.stdout.splitlines():
+            columns = line.split()
+            if (len(columns) >= 4 and columns[0].upper() == "TCP"
+                    and columns[1].endswith(suffix) and columns[3] == "LISTENING"):
+                subprocess.run(
+                    ["taskkill", "/PID", columns[4], "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+                )
+        return not port_is_open(host, port)
+    command = ["fuser", "-k", f"{port}/tcp"] if sys.platform == "linux" else \
+        ["lsof", "-t", "-i", f"TCP:{port}", "-s", "TCP:LISTEN", "-S"]
+    try:
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=timeout, check=False)
+    except OSError:
+        return False
+    return not port_is_open(host, port)
 
 
 def read_pid(path: Path) -> int | None:

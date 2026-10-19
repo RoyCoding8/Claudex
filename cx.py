@@ -10,6 +10,7 @@ from modules.launcher import launch_claude
 from modules.models import Model, category_for, fetch_models, fetch_upstream_models
 from modules.pool_tui import _write_pools_conflict, run_pool_manager
 from modules.pools import PoolSaveRecoveryError, load_pools, pool_names, validate_pools_against_models
+from modules.process import PortOccupiedError, kill_port_occupant
 from modules.proxy import ensure_proxy
 from modules.router_starter import StopOutcome, ensure_router, read_router_pid, router_is_ready, stop_router
 from modules.tui import run_picker
@@ -101,7 +102,8 @@ def _router_console() -> None:
 
 def _configure_extra_models(model_list: list[Model]) -> None:
     from modules.tui import set_extra_model
-    for key, title in (("gpt_fast_model", "[Fast/Haiku]"), ("gpt_medium_model", "[Medium/Sonnet]"), ("gpt_subagent_model", "[Subagent]")):
+    for key, title in (("gpt_fast_model", "[Fast/Haiku]"), ("gpt_medium_model", "[Medium/Sonnet]"),
+                       ("gpt_subagent_model", "[Subagent]"), ("gpt_fable_model", "[Fable]")):
         selected = run_picker(model_list, picker_title=f"{title} Select model or pool · Del clear · Esc cancel", sub_picker=True)
         if selected.action == "cancel":
             break
@@ -154,11 +156,23 @@ def main() -> int:
     extra_arguments = sys.argv[1:]
     while True:
         try:
-            ensure_proxy()
-            upstream_models = fetch_upstream_models()
-            if not upstream_models:
-                raise RuntimeError("CLIProxyAPI returned no models. Check provider configuration, then retry.")
-            ensure_router()
+            try:
+                ensure_proxy()
+                upstream_models = fetch_upstream_models()
+                if not upstream_models:
+                    raise RuntimeError("CLIProxyAPI returned no models. Check provider configuration, then retry.")
+                ensure_router()
+            except PortOccupiedError as occupied:
+                clear_console()
+                print(f"{occupied}\n")
+                answer = (_ask("Do you wish to kill it? (Y/n) ") or "").strip().lower()
+                if answer in {"", "y", "yes"}:
+                    if kill_port_occupant(occupied.host, occupied.port):
+                        continue
+                    print(f"\nPort {occupied.port} could not be freed. It was left running.")
+                else:
+                    print("\nThe occupying process was left running.")
+                return 130
             current_pools = load_pools(upstream_models=upstream_models)
             for warning in validate_pools_against_models(current_pools, upstream_models):
                 print(f"Warning: {warning}")
@@ -201,6 +215,7 @@ def main() -> int:
                     result.model.id, result.skip_permissions, result.context_tokens,
                     result.auto_compact, extra_arguments, result.gpt_fast_model,
                     result.gpt_medium_model, result.gpt_subagent_model,
+                    result.gpt_fable_model,
                     openai_family=_is_openai_family(result.model, upstream_models, current_pools),
                 )
                 if exit_code != 0 and not _was_interrupted(exit_code):

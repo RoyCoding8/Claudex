@@ -35,6 +35,7 @@ class PickerResult:
     gpt_fast_model: str | None = None
     gpt_medium_model: str | None = None
     gpt_subagent_model: str | None = None
+    gpt_fable_model: str | None = None
 
 
 def _exit_once(event, result: PickerResult) -> None:
@@ -202,7 +203,7 @@ def _has_terminal_control(value: str) -> bool:
 
 
 def _validate_model_settings(data: dict) -> None:
-    for key in ("last_model", "gpt_fast_model", "gpt_medium_model", "gpt_subagent_model"):
+    for key in ("last_model", "gpt_fast_model", "gpt_medium_model", "gpt_subagent_model", "gpt_fable_model"):
         value = data.get(key)
         if isinstance(value, str) and _has_terminal_control(value):
             raise ValueError(f"settings field {key!r} contains a terminal control character")
@@ -225,7 +226,7 @@ def _normalise_settings(data: dict) -> dict:
     last_model = data.get("last_model")
     if not isinstance(last_model, str) or _has_terminal_control(last_model):
         data.pop("last_model", None)
-    for key in ("gpt_fast_model", "gpt_medium_model", "gpt_subagent_model"):
+    for key in ("gpt_fast_model", "gpt_medium_model", "gpt_subagent_model", "gpt_fable_model"):
         if key in data and (
             not isinstance(data[key], str) or _has_terminal_control(data[key])
         ):
@@ -462,6 +463,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
     gpt_fast_model = settings.get("gpt_fast_model")
     gpt_medium_model = settings.get("gpt_medium_model")
     gpt_subagent_model = settings.get("gpt_subagent_model")
+    gpt_fable_model = settings.get("gpt_fable_model")
     selected_index = 0
     visible_models: list[Model] = []
 
@@ -525,6 +527,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
             current_settings.get("gpt_fast_model"),
             current_settings.get("gpt_medium_model"),
             current_settings.get("gpt_subagent_model"),
+            current_settings.get("gpt_fable_model"),
         )
 
     def selected_model() -> Model | None:
@@ -583,6 +586,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
                     ("Fast", gpt_fast_model),
                     ("Medium", gpt_medium_model),
                     ("Subagent", gpt_subagent_model),
+                    ("Fable", gpt_fable_model),
                 )
                 for fragment in (
                     ("class:label", f" {label}: "),

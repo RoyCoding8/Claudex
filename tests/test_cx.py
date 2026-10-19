@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import cx
 from modules.config import ConfigError, ConfigSource
@@ -83,7 +83,7 @@ class MainLoopTests(unittest.TestCase):
 
         self.assertEqual(
             launch.call_args.args,
-            ("pool/name", True, 100000, True, ["", "--flag=a&b"], "fast", "medium", "subagent"),
+            ("pool/name", True, 100000, True, ["", "--flag=a&b"], "fast", "medium", "subagent", None),
         )
         self.assertEqual(launch.call_args.kwargs, {"openai_family": False})
 
@@ -381,6 +381,45 @@ class MainLoopTests(unittest.TestCase):
         self.assertEqual(code, 0)
         pause.assert_not_called()
 
+
+class PortOccupancyTests(unittest.TestCase):
+    def _run(self, answers, killed=True):
+        from modules.process import PortOccupiedError
+        ensure_proxy = MagicMock(side_effect=[PortOccupiedError("127.0.0.1", 4000), None])
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(cx, "ensure_proxy", ensure_proxy))
+            stack.enter_context(patch.object(cx, "ensure_router", lambda: None))
+            stack.enter_context(patch.object(cx, "fetch_upstream_models", lambda *a, **k: [Model("m", "prov")]))
+            stack.enter_context(patch.object(cx, "load_pools", lambda *a, **k: []))
+            stack.enter_context(patch.object(cx, "fetch_models", lambda *a, **k: [Model("m", "prov")]))
+            stack.enter_context(patch.object(cx, "run_picker", lambda *a, **k: PickerResult("exit", None, False, None)))
+            stack.enter_context(patch.object(cx, "clear_console"))
+            kill = stack.enter_context(patch.object(cx, "kill_port_occupant", return_value=killed))
+            stack.enter_context(patch.object(cx, "_ask", side_effect=list(answers)))
+            code = cx.main()
+        return code, ensure_proxy.call_count, kill
+
+    def test_yes_kills_and_retries_startup(self):
+        code, calls, kill = self._run(["y"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, 2)
+        kill.assert_called_once_with("127.0.0.1", 4000)
+
+    def test_empty_answer_kills_by_default(self):
+        code, calls, kill = self._run([""])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, 2)
+
+    def test_no_quits_without_killing(self):
+        code, calls, kill = self._run(["n"])
+        self.assertEqual(code, 130)
+        self.assertEqual(calls, 1)
+        kill.assert_not_called()
+
+    def test_failed_kill_quits(self):
+        code, calls, _kill = self._run(["y"], killed=False)
+        self.assertEqual(code, 130)
+        self.assertEqual(calls, 1)
 
 class ManagementUrlTests(unittest.TestCase):
     @patch("cx._ask", return_value="")

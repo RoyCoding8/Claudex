@@ -834,7 +834,7 @@ class ProxyEndpointTests(unittest.TestCase):
                         self.assertTrue(proxy.proxy_is_ready())
                         with patch.object(models, "PROXY_API_KEY", "wrong-key"):
                             self.assertFalse(proxy.proxy_is_ready())
-                            with self.assertRaisesRegex(RuntimeError, "left running"):
+                            with self.assertRaises(process.PortOccupiedError):
                                 proxy.ensure_proxy()
                         self.assertTrue(proxy.proxy_is_ready())
                         spawn.assert_not_called()

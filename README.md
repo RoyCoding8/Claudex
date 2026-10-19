@@ -248,7 +248,7 @@ CLIProxyAPI:
 - `CX_CLIPROXY_START_TIMEOUT` (default 15): startup grace period for CLIProxyAPI
 
 Model roles:
-- `CX_GPT_FAST_MODEL`, `CX_GPT_MEDIUM_MODEL`, `CX_GPT_SUBAGENT_MODEL`
+- `CX_GPT_FAST_MODEL`, `CX_GPT_MEDIUM_MODEL`, `CX_GPT_SUBAGENT_MODEL`, `CX_GPT_FABLE_MODEL`
 - `CX_DEFAULT_COMPACT_WINDOW` (default 170000): default auto-compact window
 
 ## Files

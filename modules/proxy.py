@@ -8,6 +8,7 @@ from typing import TextIO
 from . import process
 from .config import DATA_DIR, PROXY_CONFIG, PROXY_EXE, PROXY_HOST, PROXY_LOG, PROXY_PID, PROXY_PORT, PROXY_START_TIMEOUT
 from .models import fetch_upstream_models
+from .process import PortOccupiedError
 
 _LOG_ROTATE_BYTES = 5_000_000
 _STOP_TIMEOUT = 5.0
@@ -38,10 +39,7 @@ def _startup_lock() -> TextIO | None:
 
 def _reuse_listener(deadline: float) -> None:
     if not _wait_for_proxy_readiness(deadline):
-        raise RuntimeError(
-            f"Port {PROXY_PORT} did not answer the authenticated models endpoint. "
-            f"It was left running; check {PROXY_LOG} or set CX_CLIPROXY_PORT."
-        )
+        raise PortOccupiedError(PROXY_HOST, PROXY_PORT)
 
 
 def _publish_pid(pid: int) -> None:

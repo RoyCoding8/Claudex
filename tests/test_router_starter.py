@@ -66,8 +66,9 @@ class RouterIdentityTests(unittest.TestCase):
             listener.listen()
             with patch.object(rs, "ROUTER_PORT", listener.getsockname()[1]), \
                     patch.object(rs.subprocess, "Popen") as spawn:
-                with self.assertRaisesRegex(RuntimeError, "left running"):
+                with self.assertRaises(rs.PortOccupiedError) as raised:
                     rs.ensure_router()
+                self.assertEqual(raised.exception.port, listener.getsockname()[1])
                 self.assertIs(rs.stop_router(), rs.StopOutcome.REFUSED)
             spawn.assert_not_called()
 

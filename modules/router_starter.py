@@ -21,6 +21,7 @@ from .config import (
     ROUTER_PORT,
     ROUTER_START_TIMEOUT,
 )
+from .process import PortOccupiedError
 
 _STOP_TIMEOUT = 5.0
 _MAX_HEALTH_BYTES = 16 * 1024
@@ -162,7 +163,7 @@ def ensure_router() -> None:
         if router_is_ready():
             return
         if process.port_is_open(ROUTER_HOST, ROUTER_PORT):
-            raise RuntimeError(f"Port {ROUTER_PORT} is occupied by an unverified or unresponsive process. It was left running.")
+            raise PortOccupiedError(ROUTER_HOST, ROUTER_PORT)
         process.rotate_spawn_log(ROUTER_BOOT_LOG, 5_000_000)
         environment = os.environ.copy()
         environment.setdefault("PYTHONIOENCODING", "utf-8")

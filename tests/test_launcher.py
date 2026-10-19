@@ -240,6 +240,28 @@ class LauncherTests(unittest.TestCase):
         env = call.call_args.kwargs["env"]
         self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "gpt-fast-pool")
 
+    @patch("modules.launcher.subprocess.call", return_value=0)
+    @patch("modules.launcher.shutil.which", return_value="claude")
+    def test_role_env_vars_carry_chosen_models(self, _which, call) -> None:
+        launch_claude(
+            "glm-pool", False, None, None, [],
+            gpt_fast_model="x/fast", gpt_medium_model="x/medium",
+            gpt_subagent_model="x/subagent", gpt_fable_model="x/fable",
+        )
+        env = call.call_args.kwargs["env"]
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "x/fast")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "x/medium")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "glm-pool")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "x/fable")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "x/subagent")
+
+    @patch("modules.launcher.subprocess.call", return_value=0)
+    @patch("modules.launcher.shutil.which", return_value="claude")
+    def test_fable_role_defaults_to_the_launch_model(self, _which, call) -> None:
+        launch_claude("glm-pool", False, None, None, [])
+        env = call.call_args.kwargs["env"]
+        self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "glm-pool")
+
 
 if __name__ == "__main__":
     unittest.main()

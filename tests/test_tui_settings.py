@@ -205,12 +205,13 @@ class _ScreenAssertions(unittest.TestCase):
         self.assertIn("".join(text.split()), "".join(screen.split()))
 
     def _assert_roles_row(
-        self, screen: str, fast: str = "default", medium: str = "default", subagent: str = "default"
+        self, screen: str, fast: str = "default", medium: str = "default",
+        subagent: str = "default", fable: str = "default",
     ) -> None:
         rows = [row for row in screen.splitlines() if "Fast:" in row]
         self.assertEqual(len(rows), 1, screen)
         squeezed = "".join(rows[0].split())
-        for label, value in (("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent)):
+        for label, value in (("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent), ("Fable:", fable)):
             self.assertIn(f"{label}{value}", squeezed)
         self.assertIn("GW:", squeezed)
 
@@ -1297,6 +1298,7 @@ class PickerScreenTests(_ScreenAssertions):
             "gpt_fast_model": "openai/fast-model",
             "gpt_medium_model": "anthropic/medium-model",
             "gpt_subagent_model": "xai/subagent-model",
+            "gpt_fable_model": "pool/fable-model",
         }
         for columns in (40, 81, 200):
             with self.subTest(columns=columns):
@@ -1304,7 +1306,7 @@ class PickerScreenTests(_ScreenAssertions):
                 self._assert_shows(
                     screen,
                     "Fast: openai/fast-model   Medium: anthropic/medium-model"
-                    "   Subagent: xai/subagent-model",
+                    "   Subagent: xai/subagent-model   Fable: pool/fable-model",
                 )
 
     def test_the_sub_picker_ignores_keys_it_cannot_act_on(self):
