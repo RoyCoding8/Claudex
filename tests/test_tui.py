@@ -123,7 +123,14 @@ def _run_real_picker(
     return result[0]
 
 
-class PickerExitTests(unittest.TestCase):
+class _ClaudeClientTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        client = patch("modules.tui.ACTIVE_CLIENT", "claude")
+        client.start()
+        self.addCleanup(client.stop)
+
+
+class PickerExitTests(_ClaudeClientTestCase):
     def test_a_launch_key_reports_its_own_action_exactly_once(self) -> None:
         class F10Application(_DoubleExitApplication):
             keys = ["Keys.F10"]
@@ -206,7 +213,7 @@ class PickerExitTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (result.gpt_fast_model, result.gpt_medium_model, result.gpt_subagent_model),
+            tuple(result.role_models.get(key) for key in ("gpt_fast_model", "gpt_medium_model", "gpt_subagent_model")),
             (None, None, None),
         )
 
@@ -256,7 +263,7 @@ class PickerExitTests(unittest.TestCase):
             saved = json.loads(settings_file.read_text(encoding="utf-8"))
 
         self.assertEqual(
-            (result.gpt_fast_model, result.gpt_medium_model, result.gpt_subagent_model),
+            tuple(result.role_models.get(key) for key in ("gpt_fast_model", "gpt_medium_model", "gpt_subagent_model")),
             ("new/fast", "new/medium", "new/subagent"),
         )
         self.assertEqual(
@@ -295,7 +302,7 @@ class ModelFilterTests(unittest.TestCase):
         )
 
 
-class ModelParameterTests(unittest.TestCase):
+class ModelParameterTests(_ClaudeClientTestCase):
     def test_editor_updates_selected_model_and_preserves_other_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

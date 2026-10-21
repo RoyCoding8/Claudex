@@ -223,6 +223,40 @@ DEFAULT_GPT_SUBAGENT_MODEL = _env("CX_GPT_SUBAGENT_MODEL", default="")
 DEFAULT_GPT_FABLE_MODEL = _env("CX_GPT_FABLE_MODEL", default="")
 DEFAULT_COMPACT_WINDOW = _env_int("CX_DEFAULT_COMPACT_WINDOW", default=170000, minimum=1)
 
+# Each role is (settings key, label, launch target, OpenAI-family default, agent description).
+# Targets are ('env', *variable names), ('config', key), or ('agent', name).
+CLIENTS = {
+    "claude": ("Claude Code", (
+        ("gpt_fast_model", "Fast/Haiku", ("env", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"), DEFAULT_GPT_FAST_MODEL, ""),
+        ("gpt_medium_model", "Medium/Sonnet", ("env", "ANTHROPIC_DEFAULT_SONNET_MODEL"), DEFAULT_GPT_MEDIUM_MODEL, ""),
+        ("gpt_subagent_model", "Subagent", ("env", "CLAUDE_CODE_SUBAGENT_MODEL"), DEFAULT_GPT_SUBAGENT_MODEL, ""),
+        ("gpt_fable_model", "Fable", ("env", "ANTHROPIC_DEFAULT_FABLE_MODEL"), DEFAULT_GPT_FABLE_MODEL, ""),
+    )),
+    "codex": ("Codex", (
+        ("codex_default_subagent_model", "Default subagent", ("config", "agents.default_subagent_model"), "", ""),
+        ("codex_explorer_model", "Explorer", ("agent", "explorer"), "", "Explore the codebase and report findings without changing files."),
+        ("codex_worker_model", "Worker", ("agent", "worker"), "", "Implement the assigned coding task and report the changes."),
+    )),
+}
+
+_CLIENT_ALIASES = {"cc": "claude", "claude": "claude", "codex": "codex"}
+_client_value = _env("CX_CLIENT", default="cc").lower()
+if _client_value in _CLIENT_ALIASES:
+    ACTIVE_CLIENT = _CLIENT_ALIASES[_client_value]
+else:
+    _source, _source_label_value = _env_source("CX_CLIENT")
+    CONFIG_ERRORS.append(ConfigError(
+        f"CX_CLIENT from {_source_label_value} must be 'cc' (or 'claude') or 'codex', got {_client_value!r}.",
+        _source,
+    ))
+    ACTIVE_CLIENT = "claude"
+
+CLIENT_ROLE_SETTINGS = tuple(
+    role[0]
+    for _client_name, (_display_name, _roles) in CLIENTS.items()
+    for role in _roles
+)
+
 if (not is_local_host(PROXY_HOST) or is_wildcard_host(PROXY_HOST)) and PROXY_API_KEY == _DEFAULT_PROXY_API_KEY:
     source, source_label = _env_source("CX_CLIPROXY_API_KEY")
     CONFIG_ERRORS.append(ConfigError(

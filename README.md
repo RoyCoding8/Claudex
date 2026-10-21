@@ -5,7 +5,7 @@
 <h1 align="center">Claudex</h1>
 
 <p align="center">
-  A TUI launcher that routes Claude Code through a local proxy and pools providers behind one model name.
+  A TUI launcher that routes Claude Code or Codex through a local proxy and pools providers behind one model name.
 </p>
 
 <p align="center">
@@ -72,7 +72,7 @@ chmod +x cx.sh   # first time only
 ./cx.sh
 ```
 
-Both wrappers take the same arguments and pass anything they don't consume through to Claude Code.
+Both wrappers take the same arguments and pass anything they don't consume through to the selected client.
 `cx.sh` resolves symlinks, so you can link it onto your `PATH`
 (`ln -s "$PWD/cx.sh" ~/.local/bin/cx`) and run `cx` from any directory.
 
@@ -82,10 +82,17 @@ The first run uses [`uv`](https://github.com/astral-sh/uv) to install `prompt-to
 1. Starts CLIProxyAPI if it isn't already running.
 2. Starts the cx router if it isn't already running.
 3. Opens the model picker, merging CLIProxyAPI's `/v1/models` with your local pool aliases.
-4. Launches Claude Code pointed at the router.
+4. Launches the selected client pointed at the router.
 
-Claude Code receives `ANTHROPIC_BASE_URL=http://127.0.0.1:4000` and gateway model discovery
-enabled, so it uses whichever model or pool you selected.
+Claude Code is the default. Set `CX_CLIENT=codex` in `.env` or the process environment to launch
+Codex. The process environment wins if both sources set the value. Codex receives invocation-only
+provider and model settings. The launcher does not write `~/.codex/config.toml`, change
+`CODEX_HOME`, or modify your existing agent files. Both clients use the same model list,
+pools, context settings, permissions toggle, and F6 role picker.
+
+Press **F6** to choose client-specific role models. Claude Code offers Fast/Haiku, Medium/Sonnet,
+Subagent, and Fable. Codex offers Default subagent, Explorer, and Worker; any unset Codex role
+uses the main model selected in the picker.
 
 ## Creating a pool
 
@@ -94,7 +101,7 @@ CLIProxyAPI's `management.html`.
 
 Press **F7** in the model picker to create cross-provider pools:
 
-1. Name the pool the way you want Claude Code to see it, e.g. `Opus-level`.
+1. Name the pool the way you want the selected client to see it, e.g. `Opus-level`.
 2. Add ≥ 2 provider-specific model IDs (`nvidia_nim/z-ai/glm-5.2`, `vercel/zai/glm-5.2`, ...).
 3. Optionally set an RPM per member. If unsure, leave blank (auto).
 4. Optionally set a priority per member (lower number = tried first).
@@ -126,17 +133,26 @@ cap: a member with `rpm: 5` will be sent at most 5 requests per trailing 60 s wi
 other member is busy. Set `limit` explicitly if you want a cap that differs from the weight, and
 `cooldown` (seconds) to override the default cool-off after a failed attempt.
 
-Selecting a pool in the picker tells Claude Code to send its `model` field as the pool name (e.g.
-`Opus-level`). The router rewrites that name to a real backend model per request.
+Selecting a pool in the picker tells the selected client to send its `model` field as the pool name
+(e.g. `Opus-level`). The router rewrites that name to a real backend model per request.
 
 ## Model parameters
 
 Highlight a model or pool and press **F10** to edit its per-model launch settings:
 
-- **Context size** writes `context_tokens` under that model in `data/settings.json` and sets
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` when launched. Commas and underscores are accepted.
-- **Auto-compact** can be `on`, `off`, or `default`. `off` disables compacting; `on` uses 85% of
-  the configured context size as the auto-compact window; `default` removes the override.
+- **Context size** writes `context_tokens` under that model in `data/settings.json`. Claude Code
+  receives `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; Codex receives `model_context_window`. Commas and
+  underscores are accepted.
+- **Claude Code auto-compact** can be `on`, `off`, or `default`. `off` disables compacting; `on`
+  uses 85% of the configured context size, or `CX_DEFAULT_COMPACT_WINDOW` when no size is set;
+  `default` removes the override.
+- **Codex auto-compact** accepts `on` or `default`. `on` sets
+  `model_auto_compact_token_limit` to 85% of the configured context size, or
+  `CX_DEFAULT_COMPACT_WINDOW` when no size is set. `default` leaves the threshold in your Codex
+  settings. cx has no supported way to disable Codex auto-compaction. If an existing model entry
+  says `off`, the picker displays a notice and the launcher leaves Codex's configured threshold
+  alone.
+  The cx provider marks remote compaction unsupported, so Codex uses its local compaction path.
 
 Press Enter to keep the current value or type `clear` to restore its default. The editor preserves
 other models and unknown per-model keys. In the picker, **Esc** clears a non-empty search first and
@@ -189,7 +205,9 @@ safely discuss `event: error` without triggering a failover.
 ## Pointing Codex at a pool
 
 `wire_api = "responses"` is the only value Codex supports, which is why `/v1/responses` is pooled.
-In `~/.codex/config.toml`:
+Set `CX_CLIENT=codex` to use Codex through cx. The launcher supplies its provider settings for that
+invocation. The standalone example below is for running Codex directly, outside cx. In
+`~/.codex/config.toml`:
 
 ```toml
 model = "Opus-level"
@@ -214,7 +232,7 @@ Defaults:
 | CLIProxyAPI   | `127.0.0.1:8317`       | `sk-dummy`     |
 | cx router     | `127.0.0.1:4000`       | `sk-cx-local`  |
 
-Both keys are for local traffic between Claude Code, the router, and CLIProxyAPI on your machine.
+Both keys are for local traffic between the selected client, the router, and CLIProxyAPI on your machine.
 Real provider credentials live inside CLIProxyAPI's `config.yaml`, never in this repo.
 The built-in keys are accepted only on loopback. Wildcard binds (`0.0.0.0` or `::`) require
 explicit non-default keys. Both services use plain HTTP, so a custom key does not protect traffic
@@ -227,7 +245,11 @@ lines you want to change. The launcher and the router both read it at
 startup. A value already present in the real environment (shell export /
 launcher) always wins over the file, and unset lines fall back to the built-in
 defaults. Real provider credentials live in CLIProxyAPI's `config.yaml`, never
-in `.env`; this file only configures local traffic. `.env` is git-ignored.
+in `.env`; this file configures the selected client and local traffic. `.env` is git-ignored.
+
+Client:
+- `CX_CLIENT` (default `cc`): set to `codex` to launch Codex. `claude` is also accepted as an alias
+  for `cc`.
 
 Router:
 - `CX_ROUTER_HOST`, `CX_ROUTER_PORT`, `CX_ROUTER_API_KEY`
@@ -248,8 +270,12 @@ CLIProxyAPI:
 - `CX_CLIPROXY_START_TIMEOUT` (default 15): startup grace period for CLIProxyAPI
 
 Model roles:
-- `CX_GPT_FAST_MODEL`, `CX_GPT_MEDIUM_MODEL`, `CX_GPT_SUBAGENT_MODEL`, `CX_GPT_FABLE_MODEL`
-- `CX_DEFAULT_COMPACT_WINDOW` (default 170000): default auto-compact window
+- Claude Code defaults: `CX_GPT_FAST_MODEL`, `CX_GPT_MEDIUM_MODEL`, `CX_GPT_SUBAGENT_MODEL`,
+  `CX_GPT_FABLE_MODEL`.
+- Codex role choices are saved separately as `codex_default_subagent_model`,
+  `codex_explorer_model`, and `codex_worker_model` in `data/settings.json`.
+- `CX_DEFAULT_COMPACT_WINDOW` (default 170000): auto-compact threshold when enabled and no context
+  size is set.
 
 ## Files
 
@@ -266,7 +292,7 @@ modules/
   router_starter.py         # router lifecycle (health check + subprocess spawn)
   pools.py                  # pools.json schema + load/save + validation
   models.py                 # /v1/models fetch, dedup, categorization
-  launcher.py               # spawn Claude Code with ANTHROPIC_BASE_URL set
+  launcher.py               # launch the selected client through the cx router
   router_state.py           # in-memory quotas and cooldowns, restart snapshots
   tui.py                    # model picker
   pool_tui.py               # F7 pool editor
@@ -301,7 +327,7 @@ data/
 tests/
   test_config_errors.py     # invalid environment values and import behavior
   test_cx.py                # launcher loop, wrappers, and malformed pool files
-  test_launcher.py          # Claude Code environment setup
+  test_launcher.py          # client environment and launch setup
   test_models.py            # /v1/models fetch and deduplication
   test_pool_hardening.py    # pool parsing edge cases and atomic writes
   test_pool_tui.py          # pool editor state transitions

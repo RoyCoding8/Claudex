@@ -25,6 +25,11 @@ _POOLS_THEN_EXIT = (
 
 
 class MainLoopTests(unittest.TestCase):
+    def setUp(self) -> None:
+        client = patch.object(cx, "ACTIVE_CLIENT", "claude")
+        client.start()
+        self.addCleanup(client.stop)
+
     @staticmethod
     def _patched(stack, picker, model="m", **overrides):
         """Inert stand-ins for the main loop's collaborators; `overrides` replaces any target."""
@@ -65,7 +70,10 @@ class MainLoopTests(unittest.TestCase):
     def test_launch_dispatches_selected_model_and_exact_cli_arguments(self):
         model = Model("pool/name", "owner")
         picks = iter([
-            PickerResult("launch", model, True, 100000, True, "fast", "medium", "subagent"),
+            PickerResult(
+                "launch", model, True, 100000, True,
+                {"gpt_fast_model": "fast", "gpt_medium_model": "medium", "gpt_subagent_model": "subagent"},
+            ),
             PickerResult("exit", None, False, None),
         ])
 
@@ -76,16 +84,57 @@ class MainLoopTests(unittest.TestCase):
                 model,
                 clear_console=lambda: None,
             )
-            launch = stack.enter_context(patch.object(cx, "launch_claude", return_value=0))
+            launch = stack.enter_context(patch.object(cx, "launch_client", return_value=0))
             stack.enter_context(patch.object(sys, "argv", ["cx.py", "", "--flag=a&b"]))
 
             self.assertEqual(cx.main(), 0)
 
         self.assertEqual(
             launch.call_args.args,
-            ("pool/name", True, 100000, True, ["", "--flag=a&b"], "fast", "medium", "subagent", None),
+            ("pool/name", True, 100000, True, ["", "--flag=a&b"]),
         )
-        self.assertEqual(launch.call_args.kwargs, {"openai_family": False})
+        self.assertEqual(
+            launch.call_args.kwargs,
+            {
+                "role_models": {
+                    "gpt_fast_model": "fast",
+                    "gpt_medium_model": "medium",
+                    "gpt_subagent_model": "subagent",
+                },
+                "openai_family": False,
+            },
+        )
+
+    def test_main_dispatches_codex_role_models_through_the_shared_launcher(self):
+        model = Model("provider/root", "owner")
+        picks = iter((
+            PickerResult("launch", model, False, 128000, True, {
+                "codex_default_subagent_model": "provider/subagent",
+                "codex_explorer_model": "provider/explorer",
+                "codex_worker_model": "provider/worker",
+            }),
+            PickerResult("exit", None, False, None),
+        ))
+        with ExitStack() as stack:
+            self._patched(stack, lambda *args, **kwargs: next(picks), model, clear_console=lambda: None)
+            stack.enter_context(patch.object(cx, "ACTIVE_CLIENT", "codex"))
+            launch = stack.enter_context(patch.object(cx, "launch_client", return_value=0))
+            stack.enter_context(patch.object(sys, "argv", ["cx.py"]))
+
+            self.assertEqual(cx.main(), 0)
+
+        self.assertEqual(
+            launch.call_args.args,
+            ("provider/root", False, 128000, True, []),
+        )
+        self.assertEqual(
+            launch.call_args.kwargs["role_models"],
+            {
+                "codex_default_subagent_model": "provider/subagent",
+                "codex_explorer_model": "provider/explorer",
+                "codex_worker_model": "provider/worker",
+            },
+        )
 
     def test_pool_management_action_returns_to_picker(self):
         model = Model("m", "prov")
@@ -257,7 +306,7 @@ class MainLoopTests(unittest.TestCase):
                     self._patched(
                         stack,
                         lambda *args, _picks=picks, **kwargs: next(_picks),
-                        launch_claude=lambda *a, **k: 7,
+                        launch_client=lambda *a, **k: 7,
                         clear_console=lambda: None,
                     )
                     if closed_stdin:
@@ -306,6 +355,29 @@ class MainLoopTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(configured, [[model]])
 
+    def test_codex_role_configuration_uses_the_codex_table_and_settings_keys(self):
+        models = [Model("main/model", "owner"), Model("role/model", "owner")]
+        picks = iter((
+            PickerResult("launch", models[1], False, None),
+            PickerResult("clear", None, False, None),
+            PickerResult("cancel", None, False, None),
+        ))
+        opened = []
+        saved = []
+
+        with (
+            patch.object(cx, "ACTIVE_CLIENT", "codex"),
+            patch.object(cx, "run_picker", side_effect=lambda *args, **kwargs: (opened.append(kwargs["picker_title"]) or next(picks))),
+            patch("modules.tui.set_extra_model", side_effect=lambda *args: saved.append(args)),
+        ):
+            cx._configure_extra_models(models)
+
+        self.assertEqual([title.split("]")[0] + "]" for title in opened], ["[Default subagent]", "[Explorer]", "[Worker]"])
+        self.assertEqual(saved, [
+            ("codex_default_subagent_model", "role/model"),
+            ("codex_explorer_model", None),
+        ])
+
     def test_nonzero_launch_returns_to_picker_and_waits_before_it_reopens(self):
         model = Model("m", "prov")
         picks = iter([
@@ -318,7 +390,7 @@ class MainLoopTests(unittest.TestCase):
                 stack,
                 lambda *args, **kwargs: next(picks),
                 model,
-                launch_claude=lambda *a, **k: 7,
+                launch_client=lambda *a, **k: 7,
                 clear_console=lambda: None,
             )
             output = stack.enter_context(patch("builtins.print"))
@@ -351,7 +423,7 @@ class MainLoopTests(unittest.TestCase):
                     self._patched(
                         stack,
                         picker,
-                        launch_claude=launch,
+                        launch_client=launch,
                         clear_console=lambda: None,
                     )
                     output = stack.enter_context(patch("builtins.print"))

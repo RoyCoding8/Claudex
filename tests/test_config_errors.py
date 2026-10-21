@@ -17,6 +17,7 @@ from modules.urls import is_local_host
 _SNAPSHOT_KEYS = (
     "ROUTER_PORT", "ROUTER_POOL_PASSES", "ROUTER_COOLDOWN_429", "ROUTER_START_TIMEOUT", "DEFAULT_COMPACT_WINDOW",
     "PROXY_EXE", "PROXY_CONFIG", "PROXY_HOST", "PROXY_API_KEY", "ROUTER_HOST", "ROUTER_API_KEY", "CONFIG_ERRORS",
+    "ACTIVE_CLIENT",
 )
 
 
@@ -46,6 +47,28 @@ def _isolated_config(file_values: dict[str, str] | None = None, **process_values
 
 
 class ConfigErrorTests(unittest.TestCase):
+    def test_client_selection_uses_process_environment_before_file_and_accepts_aliases(self):
+        with _isolated_config({"CX_CLIENT": "codex"}, CX_CLIENT="cc") as snapshot:
+            self.assertEqual(snapshot["ACTIVE_CLIENT"], "claude")
+            self.assertEqual(snapshot["CONFIG_ERRORS"], [])
+
+        with _isolated_config(CX_CLIENT="codex") as snapshot:
+            self.assertEqual(snapshot["ACTIVE_CLIENT"], "codex")
+
+        for value, expected in (("", "claude"), ("cc", "claude"), ("claude", "claude"), ("CODEX", "codex")):
+            with self.subTest(value=value), _isolated_config(CX_CLIENT=value) as snapshot:
+                self.assertEqual(snapshot["ACTIVE_CLIENT"], expected)
+                self.assertEqual(snapshot["CONFIG_ERRORS"], [])
+
+    def test_invalid_client_is_an_actionable_config_error_with_its_source(self):
+        with _isolated_config({"CX_CLIENT": "mystery"}) as snapshot:
+            errors = [error for error in snapshot["CONFIG_ERRORS"] if "CX_CLIENT" in error]
+            self.assertEqual(snapshot["ACTIVE_CLIENT"], "claude")
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0].source.value, "file")
+            self.assertIn("'cc'", errors[0])
+            self.assertIn("'codex'", errors[0])
+
     def test_negative_port_is_reported(self):
         with _isolated_config(CX_ROUTER_PORT="-5") as snapshot:
             self.assertTrue(any("CX_ROUTER_PORT" in e for e in snapshot["CONFIG_ERRORS"]))

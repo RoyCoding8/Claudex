@@ -1,7 +1,7 @@
 [project]
 name = "cx-launcher"
 version = "0.4.0"
-description = "Claude Code launcher for CLIProxyAPI with an in-house pool router"
+description = "Claude Code and Codex launcher for CLIProxyAPI with an in-house pool router"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "prompt-toolkit>=3.0.51,<4",

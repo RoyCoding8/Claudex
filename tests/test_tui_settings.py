@@ -201,6 +201,11 @@ def _write_settings_in_process(settings_path, key, value, barrier, results) -> N
 
 
 class _ScreenAssertions(unittest.TestCase):
+    def setUp(self) -> None:
+        client = patch.object(tui, "ACTIVE_CLIENT", "claude")
+        client.start()
+        self.addCleanup(client.stop)
+
     def _assert_shows(self, screen: str, text: str) -> None:
         self.assertIn("".join(text.split()), "".join(screen.split()))
 
@@ -211,7 +216,9 @@ class _ScreenAssertions(unittest.TestCase):
         rows = [row for row in screen.splitlines() if "Fast:" in row]
         self.assertEqual(len(rows), 1, screen)
         squeezed = "".join(rows[0].split())
-        for label, value in (("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent), ("Fable:", fable)):
+        for label, value in (
+            ("Fast:", fast), ("Medium:", medium), ("Subagent:", subagent), ("Fable:", fable)
+        ):
             self.assertIn(f"{label}{value}", squeezed)
         self.assertIn("GW:", squeezed)
 
@@ -288,6 +295,39 @@ class SettingsTests(_ScreenAssertions):
                             self.assertIs(reader(model), value, model)
                         else:
                             self.assertEqual(reader(model), value, model)
+
+    def test_codex_roles_save_separately_and_clearing_one_preserves_claude_and_unknown_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            settings = data_dir / "settings.json"
+            data_dir.mkdir()
+            settings.write_text(json.dumps({
+                "gpt_fast_model": "legacy/fast",
+                "codex_worker_model": "old/worker",
+                "unrelated": {"keep": True},
+            }), encoding="utf-8")
+            with patch.object(tui, "SETTINGS_FILE", settings), patch.object(tui, "DATA_DIR", data_dir):
+                set_extra_model("codex_explorer_model", "custom/explorer")
+                set_extra_model("codex_worker_model", None)
+            saved = json.loads(settings.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved, {
+            "gpt_fast_model": "legacy/fast",
+            "codex_explorer_model": "custom/explorer",
+            "unrelated": {"keep": True},
+        })
+
+    def test_codex_auto_compact_off_is_explained_and_keeps_the_existing_value(self):
+        printed = io.StringIO()
+        with (
+            patch.object(tui, "ACTIVE_CLIENT", "codex"),
+            patch("builtins.input", return_value="off"),
+            redirect_stdout(printed),
+        ):
+            value = tui._prompt_auto_compact(False)
+
+        self.assertIs(value, False)
+        self.assertIn("cannot turn Codex auto-compaction off", printed.getvalue())
 
     def test_set_extra_model_sets_reads_and_clears_value(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1308,6 +1348,33 @@ class PickerScreenTests(_ScreenAssertions):
                     "Fast: openai/fast-model   Medium: anthropic/medium-model"
                     "   Subagent: xai/subagent-model   Fable: pool/fable-model",
                 )
+
+    def test_codex_picker_shows_its_client_roles_and_unsupported_compaction_state(self):
+        initial = {
+            "codex_default_subagent_model": "provider/subagent",
+            "codex_explorer_model": "provider/explorer",
+            "codex_worker_model": "provider/worker",
+            "gpt_fast_model": "legacy/fast",
+            "model_settings": {"provider/model": {"auto_compact": False}},
+        }
+        with patch.object(tui, "ACTIVE_CLIENT", "codex"):
+            result, _source, session, _files = _drive_picker(
+                ["Keys.ControlM"], initial=initial, columns=200
+            )
+
+        screen = session.screens[-1]
+        self.assertEqual(result.role_models, {
+            "codex_default_subagent_model": "provider/subagent",
+            "codex_explorer_model": "provider/explorer",
+            "codex_worker_model": "provider/worker",
+        })
+        self._assert_shows(screen, "[Codex]")
+        self._assert_shows(
+            screen,
+            "Default subagent: provider/subagent Explorer: provider/explorer Worker: provider/worker",
+        )
+        self._assert_shows(screen, "cx leaves Codex's auto-compact threshold unchanged; off is unavailable.")
+        self.assertIs(result.auto_compact, False)
 
     def test_the_sub_picker_ignores_keys_it_cannot_act_on(self):
         models = [

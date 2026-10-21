@@ -5,8 +5,8 @@ import sys
 import traceback
 import webbrowser
 
-from modules.config import CONFIG_ERRORS, ConfigError, ConfigSource
-from modules.launcher import launch_claude
+from modules.config import ACTIVE_CLIENT, CLIENTS, CONFIG_ERRORS, ConfigError, ConfigSource
+from modules.launcher import launch_client
 from modules.models import Model, category_for, fetch_models, fetch_upstream_models
 from modules.pool_tui import _write_pools_conflict, run_pool_manager
 from modules.pools import PoolSaveRecoveryError, load_pools, pool_names, validate_pools_against_models
@@ -75,7 +75,7 @@ def _router_console() -> None:
     print("cx router\n")
     if running:
         print(f"  Status: running (PID {pid})")
-        print("\n  ⚠ Active Claude Code sessions may lose in-flight responses")
+        print("\n  ⚠ Active sessions may lose in-flight responses")
         answer = _ask("\n  [K] Kill router   [R] Restart router   [Enter] Cancel\n\n  Choice: ")
         choice = answer.strip().lower() if answer else ""
         if choice in {"k", "kill"}:
@@ -102,9 +102,12 @@ def _router_console() -> None:
 
 def _configure_extra_models(model_list: list[Model]) -> None:
     from modules.tui import set_extra_model
-    for key, title in (("gpt_fast_model", "[Fast/Haiku]"), ("gpt_medium_model", "[Medium/Sonnet]"),
-                       ("gpt_subagent_model", "[Subagent]"), ("gpt_fable_model", "[Fable]")):
-        selected = run_picker(model_list, picker_title=f"{title} Select model or pool · Del clear · Esc cancel", sub_picker=True)
+    for key, label, _target, _default, _description in CLIENTS[ACTIVE_CLIENT][1]:
+        selected = run_picker(
+            model_list,
+            picker_title=f"[{label}] Select model or pool · Del clear · Esc cancel",
+            sub_picker=True,
+        )
         if selected.action == "cancel":
             break
         if selected.action == "launch" and selected.model:
@@ -211,15 +214,13 @@ def main() -> int:
                 continue
             if result.action == "launch" and result.model:
                 clear_console()
-                exit_code = launch_claude(
+                exit_code = launch_client(
                     result.model.id, result.skip_permissions, result.context_tokens,
-                    result.auto_compact, extra_arguments, result.gpt_fast_model,
-                    result.gpt_medium_model, result.gpt_subagent_model,
-                    result.gpt_fable_model,
+                    result.auto_compact, extra_arguments, role_models=result.role_models,
                     openai_family=_is_openai_family(result.model, upstream_models, current_pools),
                 )
                 if exit_code != 0 and not _was_interrupted(exit_code):
-                    print(f"\nClaude Code exited with code {exit_code}.")
+                    print(f"\n{CLIENTS[ACTIVE_CLIENT][0]} exited with code {exit_code}.")
                     if _ask("Press Enter to return to Claudex...") is None:
                         return 130
         except (KeyboardInterrupt, EOFError):

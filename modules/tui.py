@@ -9,6 +9,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from importlib import import_module
 from pathlib import Path
 from typing import TextIO
@@ -21,7 +22,7 @@ from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 
-from .config import DATA_DIR, SETTINGS_EXAMPLE_FILE, SETTINGS_FILE
+from .config import ACTIVE_CLIENT, CLIENT_ROLE_SETTINGS, CLIENTS, DATA_DIR, SETTINGS_EXAMPLE_FILE, SETTINGS_FILE
 from .models import CATEGORIES, Model, filter_models
 
 
@@ -32,10 +33,7 @@ class PickerResult:
     skip_permissions: bool
     context_tokens: int | None
     auto_compact: bool | None = None
-    gpt_fast_model: str | None = None
-    gpt_medium_model: str | None = None
-    gpt_subagent_model: str | None = None
-    gpt_fable_model: str | None = None
+    role_models: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 def _exit_once(event, result: PickerResult) -> None:
@@ -203,7 +201,7 @@ def _has_terminal_control(value: str) -> bool:
 
 
 def _validate_model_settings(data: dict) -> None:
-    for key in ("last_model", "gpt_fast_model", "gpt_medium_model", "gpt_subagent_model", "gpt_fable_model"):
+    for key in ("last_model", *CLIENT_ROLE_SETTINGS):
         value = data.get(key)
         if isinstance(value, str) and _has_terminal_control(value):
             raise ValueError(f"settings field {key!r} contains a terminal control character")
@@ -226,7 +224,7 @@ def _normalise_settings(data: dict) -> dict:
     last_model = data.get("last_model")
     if not isinstance(last_model, str) or _has_terminal_control(last_model):
         data.pop("last_model", None)
-    for key in ("gpt_fast_model", "gpt_medium_model", "gpt_subagent_model", "gpt_fable_model"):
+    for key in CLIENT_ROLE_SETTINGS:
         if key in data and (
             not isinstance(data[key], str) or _has_terminal_control(data[key])
         ):
@@ -356,22 +354,27 @@ def _prompt_context_tokens(current: int | None) -> int | None:
             value = 0
         if value > 0:
             return value
-        print("Enter a positive integer, or 'clear' to use Claude Code's default.")
+        print("Enter a positive integer, or 'clear' to use the selected client's default.")
 
 
 def _prompt_auto_compact(current: bool | None) -> bool | None:
     current_text = {True: "on", False: "off", None: "default"}[current]
     while True:
-        raw = input(f"Auto-compact: on/off/default [{current_text}]: ").strip().lower()
+        choices = "on/default" if ACTIVE_CLIENT == "codex" else "on/off/default"
+        support = " (cx supports on/default only)" if ACTIVE_CLIENT == "codex" else ""
+        raw = input(f"Auto-compact: {choices}{support} [{current_text}]: ").strip().lower()
         if not raw:
             return current
         if raw in {"on", "yes", "y", "true", "1"}:
             return True
-        if raw in {"off", "no", "n", "false", "0"}:
+        if raw in {"off", "no", "n", "false", "0"} and ACTIVE_CLIENT != "codex":
             return False
+        if raw in {"off", "no", "n", "false", "0"}:
+            print("cx cannot turn Codex auto-compaction off; it leaves the configured threshold in place.")
+            return current
         if raw in {"clear", "default"}:
             return None
-        print("Enter 'on', 'off', or 'default'.")
+        print("Enter 'on' or 'default'." if ACTIVE_CLIENT == "codex" else "Enter 'on', 'off', or 'default'.")
 
 
 def configure_model_parameters(model_id: str) -> None:
@@ -460,10 +463,8 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
     category = persisted["category"]
     skip_permissions = persisted["skip_permissions"]
     last_model = persisted["last_model"]
-    gpt_fast_model = settings.get("gpt_fast_model")
-    gpt_medium_model = settings.get("gpt_medium_model")
-    gpt_subagent_model = settings.get("gpt_subagent_model")
-    gpt_fable_model = settings.get("gpt_fable_model")
+    role_definitions = CLIENTS[ACTIVE_CLIENT][1]
+    role_models = {role[0]: settings.get(role[0]) for role in role_definitions if settings.get(role[0])}
     selected_index = 0
     visible_models: list[Model] = []
 
@@ -524,10 +525,11 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
             skip_permissions,
             context_tokens,
             auto_compact,
-            current_settings.get("gpt_fast_model"),
-            current_settings.get("gpt_medium_model"),
-            current_settings.get("gpt_subagent_model"),
-            current_settings.get("gpt_fable_model"),
+            {
+                role[0]: current_settings[role[0]]
+                for role in role_definitions
+                if current_settings.get(role[0])
+            },
         )
 
     def selected_model() -> Model | None:
@@ -564,6 +566,7 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         lines = [
             [
                 ("class:title", f" {picker_title} "),
+                ("class:accent", f"[{CLIENTS[ACTIVE_CLIENT][0]}] "),
                 ("class:muted", "  live models from CLIProxyAPI + local pool aliases"),
             ],
             [
@@ -580,19 +583,14 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
         ]
         lines.extend([[("class:danger", f"{warning}  ")] for warning in shown_warnings])
         if not sub_picker:
-            roles = [
-                fragment
-                for label, value in (
-                    ("Fast", gpt_fast_model),
-                    ("Medium", gpt_medium_model),
-                    ("Subagent", gpt_subagent_model),
-                    ("Fable", gpt_fable_model),
-                )
-                for fragment in (
-                    ("class:label", f" {label}: "),
+            roles: list[tuple[str, str]] = []
+            for key, label, _target, _default, _description in role_definitions:
+                value = role_models.get(key)
+                header_label = label.split("/", 1)[0]
+                roles.extend((
+                    ("class:label", f" {header_label}: "),
                     ("class:accent" if value else "class:muted", value or "default"),
-                )
-            ]
+                ))
             roles.append(("class:label", "   GW: "))
             if gw_checked:
                 roles.append(("class:safe" if gw_status else "class:danger",
@@ -600,6 +598,13 @@ def run_picker(models: list[Model], picker_title: str = "Claudex", sub_picker: b
             else:
                 roles.append(("class:muted", "\u25cb\u2026 checking"))
             lines.append(roles)
+            current = selected_model()
+            if (
+                ACTIVE_CLIENT == "codex"
+                and current is not None
+                and settings.get("model_settings", {}).get(current.id, {}).get("auto_compact") is False
+            ):
+                lines.append([("class:danger", "  cx leaves Codex's auto-compact threshold unchanged; off is unavailable.")])
         fragments: list[tuple[str, str]] = []
         for line in lines:
             if fragments:
